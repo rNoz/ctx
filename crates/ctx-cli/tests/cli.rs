@@ -159,6 +159,44 @@ fn assert_search_provider_oracle(
     expected_results: usize,
     expected_match_reason: &str,
 ) {
+    assert_search_provider_oracle_with_scope(
+        packet,
+        provider,
+        query,
+        expected_results,
+        expected_match_reason,
+        "session_result",
+        "session",
+    );
+}
+
+fn assert_event_search_provider_oracle(
+    packet: &Value,
+    provider: &str,
+    query: &str,
+    expected_results: usize,
+    expected_match_reason: &str,
+) {
+    assert_search_provider_oracle_with_scope(
+        packet,
+        provider,
+        query,
+        expected_results,
+        expected_match_reason,
+        "event",
+        "event",
+    );
+}
+
+fn assert_search_provider_oracle_with_scope(
+    packet: &Value,
+    provider: &str,
+    query: &str,
+    expected_results: usize,
+    expected_match_reason: &str,
+    expected_item_type: &str,
+    expected_scope: &str,
+) {
     assert_eq!(packet["schema_version"], 1);
     assert_eq!(packet["query"], query);
     assert_eq!(packet["filters"]["provider"], provider);
@@ -172,13 +210,20 @@ fn assert_search_provider_oracle(
     for result in results {
         assert_eq!(result["provider"], provider, "provider filter failed");
         assert_eq!(result["source_exists"], true, "source_exists failed");
-        assert_eq!(result["item_type"], "event");
+        assert_eq!(result["item_type"], expected_item_type);
+        assert_eq!(result["result_scope"], expected_scope);
         assert!(result["ctx_event_id"].is_string());
         assert!(result["ctx_session_id"].is_string());
         assert!(result["provider_session_id"].is_string());
         assert!(result["source_path"].is_string());
         assert!(result["cursor"].is_string());
-        assert_suggested_next_commands(result);
+        if expected_scope == "session" {
+            assert!(result["session_importance"].is_number());
+            assert!(result["more_matches_in_session"].is_number());
+            assert_session_suggested_next_commands(result);
+        } else {
+            assert_event_suggested_next_commands(result);
+        }
         assert!(result["why_matched"]
             .as_array()
             .unwrap()
@@ -206,7 +251,34 @@ fn assert_provider_citations(result: &Value, provider: &str) {
     }
 }
 
-fn assert_suggested_next_commands(result: &Value) {
+fn assert_session_suggested_next_commands(result: &Value) {
+    let commands = result["suggested_next_commands"].as_array().unwrap();
+    assert!(
+        commands.iter().any(|command| command
+            .as_str()
+            .unwrap_or("")
+            .starts_with("ctx show session ")),
+        "missing show session suggestion in {result:#}"
+    );
+    assert!(
+        commands.iter().any(|command| {
+            let command = command.as_str().unwrap_or("");
+            command.starts_with("ctx search ")
+                && command.contains(" --session ")
+                && command.ends_with(" --events")
+        }),
+        "missing session event drilldown suggestion in {result:#}"
+    );
+    assert!(
+        commands.iter().any(|command| command
+            .as_str()
+            .unwrap_or("")
+            .starts_with("ctx locate session ")),
+        "missing locate session suggestion in {result:#}"
+    );
+}
+
+fn assert_event_suggested_next_commands(result: &Value) {
     let commands = result["suggested_next_commands"].as_array().unwrap();
     assert!(
         commands.iter().any(|command| command
@@ -950,15 +1022,44 @@ fn fresh_home_search_mvp_flow() {
         ],
     );
     let first_result = &search["results"][0];
-    assert_eq!(first_result["item_type"], "event");
+    assert_eq!(first_result["item_type"], "session_result");
+    assert_eq!(first_result["result_scope"], "session");
     let ctx_event_id = first_result["ctx_event_id"].as_str().unwrap().to_owned();
     let ctx_session_id = first_result["ctx_session_id"].as_str().unwrap().to_owned();
     assert!(first_result["provider_session_id"].is_string());
     assert!(first_result["source_path"].is_string());
     assert!(first_result["cursor"].is_string());
-    assert_suggested_next_commands(first_result);
+    assert_session_suggested_next_commands(first_result);
     assert!(first_result["citations"][0]["ctx_event_id"].is_string());
     assert!(first_result["citations"][0]["ctx_session_id"].is_string());
+
+    let event_search = json_output(ctx(&temp).args([
+        "search",
+        "onboarding",
+        "--provider",
+        "codex",
+        "--events",
+        "--json",
+    ]));
+    assert_event_search_provider_oracle(&event_search, "codex", "onboarding", 1, "message");
+
+    let session_events = json_output(ctx(&temp).args([
+        "search",
+        "onboarding",
+        "--provider",
+        "codex",
+        "--session",
+        &ctx_session_id,
+        "--events",
+        "--json",
+    ]));
+    assert_event_search_provider_oracle(&session_events, "codex", "onboarding", 1, "message");
+    assert_eq!(session_events["filters"]["session"], ctx_session_id);
+    assert!(session_events["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["ctx_session_id"] == ctx_session_id));
 
     let human_search = ctx(&temp)
         .args(["search", "onboarding"])
@@ -971,9 +1072,10 @@ fn fresh_home_search_mvp_flow() {
     assert!(human_search.contains("ctx_event_id"));
     assert!(human_search.contains("ctx_session_id"));
     assert!(human_search.contains("provider_session_id"));
-    assert!(human_search.contains("next: ctx show event"));
-    assert!(human_search.contains("next: ctx locate event"));
+    assert!(human_search.contains("session_importance"));
     assert!(human_search.contains("next: ctx show session"));
+    assert!(human_search.contains("next: ctx search \"onboarding\" --session"));
+    assert!(human_search.contains("next: ctx locate session"));
     assert!(!human_search.contains("work_record"));
     assert!(!human_search.contains("history_record"));
 

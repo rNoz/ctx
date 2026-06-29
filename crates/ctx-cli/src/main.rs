@@ -254,6 +254,13 @@ struct SearchArgs {
     event_type: Option<String>,
     #[arg(long)]
     file: Option<PathBuf>,
+    #[arg(long, help = "Search only within one ctx session id")]
+    session: Option<Uuid>,
+    #[arg(
+        long,
+        help = "Return dense event-level results instead of diverse session results"
+    )]
+    events: bool,
     #[arg(
         long,
         value_enum,
@@ -1171,6 +1178,12 @@ fn command_analytics_properties(command: &CommandRoot) -> AnalyticsProperties {
                 args.event_type.is_some(),
             );
             analytics::insert_bool(&mut properties, "has_file_filter", args.file.is_some());
+            analytics::insert_bool(
+                &mut properties,
+                "has_session_filter",
+                args.session.is_some(),
+            );
+            analytics::insert_bool(&mut properties, "event_results", args.events);
             analytics::insert_bool(&mut properties, "primary_only", args.primary_only);
             analytics::insert_bool(&mut properties, "include_subagents", args.include_subagents);
             analytics::insert_count_bucket(&mut properties, "limit_bucket", args.limit as u64);
@@ -3030,6 +3043,9 @@ impl SearchDto {
                         "title": result.title,
                         "snippet": result.snippet,
                         "rank": result.rank,
+                        "result_scope": result.result_scope,
+                        "session_importance": result.session_importance,
+                        "more_matches_in_session": result.more_matches_in_session,
                         "provider": result.provider,
                         "provider_session_id": result.provider_session_id,
                         "timestamp": result.timestamp,
@@ -3037,7 +3053,7 @@ impl SearchDto {
                         "source_path": result.raw_source_path,
                         "source_exists": result.raw_source_exists,
                         "cursor": result.cursor,
-                        "suggested_next_commands": search_next_commands(result),
+                        "suggested_next_commands": search_next_commands(result, Some(&packet.query)),
                         "why_matched": result.why_matched,
                         "citations": public_citations(&result.citations),
                         "links": result.links,
@@ -3055,6 +3071,9 @@ fn search_result_item_type(
     store: &Store,
     result: &ctx_history_search::SearchPacketResult,
 ) -> String {
+    if result.result_scope == ctx_history_search::SearchResultScope::Session {
+        return "session_result".to_owned();
+    }
     if result.event_id == Some(result.record_id) {
         return "event".to_owned();
     }
@@ -3064,20 +3083,47 @@ fn search_result_item_type(
     item_type_for_id(store, result.record_id)
 }
 
-fn search_next_commands(result: &ctx_history_search::SearchPacketResult) -> Vec<String> {
+fn search_next_commands(
+    result: &ctx_history_search::SearchPacketResult,
+    query: Option<&str>,
+) -> Vec<String> {
     let mut commands = Vec::new();
+    if result.result_scope == ctx_history_search::SearchResultScope::Session {
+        if let Some(id) = result.session_id {
+            commands.push(format!("ctx show session {id}"));
+            if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
+                commands.push(format!(
+                    "ctx search {} --session {id} --events",
+                    shell_quote(query)
+                ));
+            }
+            commands.push(format!("ctx locate session {id}"));
+        }
+    }
     if let Some(id) = result.event_id {
         commands.push(format!("ctx show event {id} --window 10"));
         commands.push(format!("ctx locate event {id}"));
     }
-    if let Some(id) = result.session_id {
-        commands.push(format!("ctx show session {id} --mode lite"));
-        commands.push(format!("ctx locate session {id}"));
-        commands.push(format!(
+    if result.result_scope != ctx_history_search::SearchResultScope::Session {
+        if let Some(id) = result.session_id {
+            if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
+                commands.push(format!(
+                    "ctx search {} --session {id} --events",
+                    shell_quote(query)
+                ));
+            }
+            commands.push(format!("ctx show session {id} --mode lite"));
+            commands.push(format!("ctx locate session {id}"));
+            commands.push(format!(
             "ctx export session {id} --mode full --format markdown --out /tmp/ctx-session-{id}.md"
         ));
+        }
     }
     commands
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("{value:?}")
 }
 
 fn public_citations(citations: &[ContextCitation]) -> Vec<Value> {
@@ -3216,6 +3262,7 @@ fn run_search(
     let options = ctx_history_search::PacketOptions {
         limit: args.limit,
         filters: search_filters(
+            args.session,
             args.provider,
             args.repo.clone(),
             args.since.clone(),
@@ -3224,6 +3271,11 @@ fn run_search(
             args.event_type.clone(),
             args.file.clone(),
         )?,
+        result_mode: if args.events {
+            ctx_history_search::SearchResultMode::Events
+        } else {
+            ctx_history_search::SearchResultMode::Sessions
+        },
         ..ctx_history_search::PacketOptions::default()
     };
     let packet = ctx_history_search::search_packet(&store, &query, &options)?;
@@ -3278,7 +3330,19 @@ fn run_search(
                 println!("  provider_session_id: {provider_session_id}");
             }
             println!("  {}", result.snippet);
-            for command in search_next_commands(&result).into_iter().take(3) {
+            if result.result_scope == ctx_history_search::SearchResultScope::Session {
+                println!("  session_importance: {:.2}", result.session_importance);
+                if result.more_matches_in_session > 0 {
+                    println!(
+                        "  more_matches_in_session: {}",
+                        result.more_matches_in_session
+                    );
+                }
+            }
+            for command in search_next_commands(&result, Some(&query))
+                .into_iter()
+                .take(3)
+            {
                 println!("  next: {command}");
             }
             for citation in result.citations.iter().take(2) {
@@ -4291,6 +4355,7 @@ fn raw_retention_json(retention: ProviderRawRetention) -> &'static str {
 }
 
 fn search_filters(
+    session: Option<Uuid>,
     provider: Option<ProviderArg>,
     repo: Option<String>,
     since: Option<String>,
@@ -4300,6 +4365,7 @@ fn search_filters(
     file: Option<PathBuf>,
 ) -> Result<ctx_history_search::SearchFilters> {
     Ok(ctx_history_search::SearchFilters {
+        session,
         provider: provider.map(ProviderArg::capture_provider),
         repo,
         since: since.as_deref().map(parse_since_filter).transpose()?,

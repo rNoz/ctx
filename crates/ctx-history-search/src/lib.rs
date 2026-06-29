@@ -35,6 +35,7 @@ pub struct PacketOptions {
     pub limit: usize,
     pub snippet_chars: usize,
     pub filters: SearchFilters,
+    pub result_mode: SearchResultMode,
 }
 
 impl Default for PacketOptions {
@@ -43,12 +44,21 @@ impl Default for PacketOptions {
             limit: DEFAULT_RESULT_LIMIT,
             snippet_chars: DEFAULT_SNIPPET_CHARS,
             filters: SearchFilters::default(),
+            result_mode: SearchResultMode::Sessions,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchResultMode {
+    Sessions,
+    Events,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ctx_history_core::CaptureProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +78,7 @@ pub struct SearchFilters {
 impl Default for SearchFilters {
     fn default() -> Self {
         Self {
+            session: None,
             provider: None,
             repo: None,
             since: None,
@@ -102,6 +113,12 @@ pub struct SearchPacketResult {
     pub title: String,
     pub snippet: String,
     pub rank: f32,
+    #[serde(default, skip_serializing_if = "is_default_result_scope")]
+    pub result_scope: SearchResultScope,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub more_matches_in_session: usize,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub session_importance: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ctx_history_core::CaptureProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +141,31 @@ pub struct SearchPacketResult {
     pub links: ContextLinks,
     #[serde(default)]
     pub visibility: Visibility,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchResultScope {
+    Session,
+    Event,
+}
+
+impl Default for SearchResultScope {
+    fn default() -> Self {
+        Self::Event
+    }
+}
+
+fn is_default_result_scope(value: &SearchResultScope) -> bool {
+    *value == SearchResultScope::Event
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_zero_f32(value: &f32) -> bool {
+    *value == 0.0
 }
 
 #[derive(Debug, Clone)]
@@ -193,56 +235,7 @@ pub fn search_packet(store: &Store, query: &str, options: &PacketOptions) -> Res
     let mut truncation = ContextTruncation::default();
     let mut results = Vec::new();
 
-    for candidate in candidates.iter().take(options.limit) {
-        let record_id = candidate
-            .primary_hit
-            .as_ref()
-            .and_then(|hit| hit.event_id.or(hit.session_id))
-            .unwrap_or(candidate.record.id);
-        results.push(SearchPacketResult {
-            record_id,
-            session_id: candidate
-                .primary_hit
-                .as_ref()
-                .and_then(|hit| hit.session_id),
-            event_id: candidate.primary_hit.as_ref().and_then(|hit| hit.event_id),
-            event_seq: candidate.primary_hit.as_ref().and_then(|hit| hit.event_seq),
-            title: safe_snippet(&candidate.record.title, 240),
-            snippet: search_snippet(
-                &candidate.record,
-                &candidate.context,
-                query,
-                options.snippet_chars,
-            ),
-            rank: candidate.score,
-            provider: candidate.primary_hit.as_ref().and_then(|hit| hit.provider),
-            provider_session_id: candidate
-                .primary_hit
-                .as_ref()
-                .and_then(|hit| hit.provider_session_id.clone()),
-            timestamp: candidate.primary_hit.as_ref().map(|hit| hit.time),
-            cwd: candidate
-                .primary_hit
-                .as_ref()
-                .and_then(|hit| hit.cwd.clone()),
-            raw_source_path: candidate
-                .primary_hit
-                .as_ref()
-                .and_then(|hit| hit.raw_source_path.clone()),
-            raw_source_exists: candidate
-                .primary_hit
-                .as_ref()
-                .and_then(|hit| hit.raw_source_exists),
-            cursor: candidate
-                .primary_hit
-                .as_ref()
-                .and_then(|hit| hit.cursor.clone()),
-            why_matched: candidate.why_matched.clone(),
-            citations: candidate.citations.clone(),
-            links: links_for(&candidate.record, &options),
-            visibility: Visibility::LocalOnly,
-        });
-    }
+    push_candidate_results(&mut results, &candidates, query, &options);
 
     let has_more = candidates.len() > results.len() || scan_budget_exhausted;
     if scan_budget_exhausted {
@@ -267,6 +260,96 @@ pub fn search_packet(store: &Store, query: &str, options: &PacketOptions) -> Res
     })
 }
 
+fn push_candidate_results(
+    results: &mut Vec<SearchPacketResult>,
+    candidates: &[Candidate],
+    query: &str,
+    options: &PacketOptions,
+) {
+    let mut clustered_index = BTreeMap::<Uuid, usize>::new();
+    for candidate in candidates {
+        let mut result = candidate_search_result(candidate, query, options);
+        if options.result_mode == SearchResultMode::Sessions {
+            let cluster_id = result.session_id.unwrap_or(result.record_id);
+            if let Some(index) = clustered_index.get(&cluster_id).copied() {
+                let existing = &mut results[index];
+                existing.more_matches_in_session =
+                    existing.more_matches_in_session.saturating_add(1);
+                existing.session_importance =
+                    session_importance(existing.rank, existing.more_matches_in_session);
+                continue;
+            }
+            if result.session_id.is_some() {
+                result.result_scope = SearchResultScope::Session;
+                result.session_importance = session_importance(result.rank, 0);
+            }
+            clustered_index.insert(cluster_id, results.len());
+        }
+        results.push(result);
+        if results.len() >= options.limit {
+            break;
+        }
+    }
+}
+
+fn candidate_search_result(
+    candidate: &Candidate,
+    query: &str,
+    options: &PacketOptions,
+) -> SearchPacketResult {
+    let record_id = candidate
+        .primary_hit
+        .as_ref()
+        .and_then(|hit| hit.event_id.or(hit.session_id))
+        .unwrap_or(candidate.record.id);
+    SearchPacketResult {
+        record_id,
+        session_id: candidate
+            .primary_hit
+            .as_ref()
+            .and_then(|hit| hit.session_id),
+        event_id: candidate.primary_hit.as_ref().and_then(|hit| hit.event_id),
+        event_seq: candidate.primary_hit.as_ref().and_then(|hit| hit.event_seq),
+        title: safe_snippet(&candidate.record.title, 240),
+        snippet: search_snippet(
+            &candidate.record,
+            &candidate.context,
+            query,
+            options.snippet_chars,
+        ),
+        rank: candidate.score,
+        result_scope: SearchResultScope::Event,
+        more_matches_in_session: 0,
+        session_importance: 0.0,
+        provider: candidate.primary_hit.as_ref().and_then(|hit| hit.provider),
+        provider_session_id: candidate
+            .primary_hit
+            .as_ref()
+            .and_then(|hit| hit.provider_session_id.clone()),
+        timestamp: candidate.primary_hit.as_ref().map(|hit| hit.time),
+        cwd: candidate
+            .primary_hit
+            .as_ref()
+            .and_then(|hit| hit.cwd.clone()),
+        raw_source_path: candidate
+            .primary_hit
+            .as_ref()
+            .and_then(|hit| hit.raw_source_path.clone()),
+        raw_source_exists: candidate
+            .primary_hit
+            .as_ref()
+            .and_then(|hit| hit.raw_source_exists),
+        cursor: candidate
+            .primary_hit
+            .as_ref()
+            .and_then(|hit| hit.cursor.clone()),
+        why_matched: candidate.why_matched.clone(),
+        citations: candidate.citations.clone(),
+        links: links_for(&candidate.record, options),
+        visibility: Visibility::LocalOnly,
+    }
+}
+
 fn fast_event_search_packet(
     store: &Store,
     query: &str,
@@ -281,12 +364,17 @@ fn fast_event_search_packet(
 
     let target_results = options.limit.saturating_add(1);
     let filtered = has_filters(&options.filters);
-    let page_size = if filtered {
+    let clustered = options.result_mode == SearchResultMode::Sessions;
+    let page_size = if clustered {
+        FILTERED_SEARCH_PAGE_SIZE.max(target_results.saturating_mul(8).max(50))
+    } else if filtered {
         FILTERED_SEARCH_PAGE_SIZE.max(target_results)
     } else {
         target_results
     };
     let mut results = Vec::new();
+    let mut clustered_results = Vec::<SearchPacketResult>::new();
+    let mut clustered_index = BTreeMap::<Uuid, usize>::new();
     let mut offset = 0_usize;
     let mut pages_scanned = 0_usize;
     let mut scan_budget_exhausted = false;
@@ -304,13 +392,45 @@ fn fast_event_search_packet(
             if !event_hit_matches_filters(&hit, &options.filters) {
                 continue;
             }
-            results.push(event_search_result(&hit, query, options.snippet_chars));
-            if results.len() >= target_results {
-                break;
+            let result = event_search_result(&hit, query, options.snippet_chars);
+            if clustered {
+                let cluster_id = result
+                    .session_id
+                    .unwrap_or(result.event_id.unwrap_or(result.record_id));
+                if let Some(index) = clustered_index.get(&cluster_id).copied() {
+                    let existing = &mut clustered_results[index];
+                    existing.more_matches_in_session =
+                        existing.more_matches_in_session.saturating_add(1);
+                    existing.session_importance =
+                        session_importance(existing.rank, existing.more_matches_in_session);
+                } else {
+                    let mut result = result;
+                    result.result_scope = if result.session_id.is_some() {
+                        SearchResultScope::Session
+                    } else {
+                        SearchResultScope::Event
+                    };
+                    result.session_importance = session_importance(result.rank, 0);
+                    clustered_index.insert(cluster_id, clustered_results.len());
+                    clustered_results.push(result);
+                }
+                if clustered_results.len() >= target_results {
+                    break;
+                }
+            } else {
+                results.push(result);
+                if results.len() >= target_results {
+                    break;
+                }
             }
         }
 
-        if !filtered || results.len() >= target_results || page_len < page_size {
+        let enough_results = if clustered {
+            clustered_results.len() >= target_results
+        } else {
+            results.len() >= target_results
+        };
+        if (!filtered && !clustered) || enough_results || page_len < page_size {
             break;
         }
         if pages_scanned >= FILTERED_SEARCH_MAX_PAGES {
@@ -324,6 +444,9 @@ fn fast_event_search_packet(
         offset = next_offset;
     }
 
+    if clustered {
+        results = clustered_results;
+    }
     let has_more = results.len() > options.limit || scan_budget_exhausted;
     if results.len() > options.limit {
         results.truncate(options.limit);
@@ -371,6 +494,11 @@ fn empty_search_packet(query: &str, options: &PacketOptions) -> SearchPacket {
 }
 
 fn event_hit_matches_filters(hit: &EventSearchHit, filters: &SearchFilters) -> bool {
+    if let Some(session_id) = filters.session {
+        if hit.session_id != Some(session_id) {
+            return false;
+        }
+    }
     if let Some(provider) = filters.provider {
         if hit.provider != Some(provider) {
             return false;
@@ -464,6 +592,9 @@ fn event_search_result(
         title: event_result_title(hit),
         snippet: matched_snippet(&hit.preview, &terms, snippet_chars),
         rank: (-hit.score as f32).max(0.0),
+        result_scope: SearchResultScope::Event,
+        more_matches_in_session: 0,
+        session_importance: 0.0,
         provider: hit.provider,
         provider_session_id: hit.session_external_session_id.clone(),
         timestamp: Some(hit.occurred_at),
@@ -543,9 +674,17 @@ fn normalize_search_result_ranks(results: &mut [SearchPacketResult]) {
     if max_rank <= 0.0 {
         return;
     }
-    for result in results {
+    for result in results.iter_mut() {
         result.rank = (result.rank / max_rank).clamp(0.0, 1.0);
     }
+    for result in results.iter_mut() {
+        result.session_importance = session_importance(result.rank, result.more_matches_in_session);
+    }
+}
+
+fn session_importance(rank: f32, more_matches_in_session: usize) -> f32 {
+    let coverage_boost = ((more_matches_in_session as f32).ln_1p() * 0.08).min(0.24);
+    (rank + coverage_boost).clamp(0.0, 1.0)
 }
 
 pub fn redacted_snippet(input: &str, max_chars: usize) -> String {
@@ -557,6 +696,7 @@ fn normalized_options(options: &PacketOptions) -> PacketOptions {
         limit: options.limit.clamp(1, MAX_RESULT_LIMIT),
         snippet_chars: options.snippet_chars.clamp(32, 2_000),
         filters: options.filters.clone(),
+        result_mode: options.result_mode,
     }
 }
 
@@ -1325,7 +1465,8 @@ fn query_terms(query: &str) -> Vec<String> {
 }
 
 fn has_filters(filters: &SearchFilters) -> bool {
-    filters.provider.is_some()
+    filters.session.is_some()
+        || filters.provider.is_some()
         || filters
             .repo
             .as_ref()
@@ -1345,6 +1486,24 @@ fn record_matches_filters(
     context: &RecordContext,
     filters: &SearchFilters,
 ) -> bool {
+    if let Some(session_id) = filters.session {
+        if !context
+            .sessions
+            .iter()
+            .any(|session| session.id == session_id)
+            && !context
+                .events
+                .iter()
+                .any(|event| event.session_id == Some(session_id))
+            && !context
+                .runs
+                .iter()
+                .any(|run| run.session_id == Some(session_id))
+        {
+            return false;
+        }
+    }
+
     if let Some(provider) = filters.provider {
         let session_match = context
             .sessions
@@ -2091,6 +2250,7 @@ mod tests {
 
         assert_eq!(packet.results.len(), 1);
         let result = &packet.results[0];
+        assert_eq!(result.result_scope, SearchResultScope::Session);
         assert_eq!(result.record_id, target_event_id);
         assert_eq!(result.event_id, Some(target_event_id));
         assert_eq!(result.session_id, Some(session.id));
@@ -2105,6 +2265,24 @@ mod tests {
                 && citation.id == target_event_id
                 && citation.cursor.as_deref() == Some("line:1024")
         }));
+
+        let event_packet = search_packet(
+            &store,
+            "large-fast-event-needle",
+            &PacketOptions {
+                limit: 5,
+                snippet_chars: 200,
+                result_mode: SearchResultMode::Events,
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(event_packet.results.len(), 1);
+        assert_eq!(
+            event_packet.results[0].result_scope,
+            SearchResultScope::Event
+        );
+        assert_eq!(event_packet.results[0].event_id, Some(target_event_id));
     }
 
     #[test]
@@ -2664,6 +2842,7 @@ mod tests {
             limit: 12,
             snippet_chars: 180,
             filters: SearchFilters::default(),
+            result_mode: SearchResultMode::Sessions,
         };
         let search_started = std::time::Instant::now();
         let search = search_packet(&store, "syntheticneedle", &options).unwrap();
@@ -2750,6 +2929,7 @@ mod tests {
             limit: 24,
             snippet_chars: 320,
             filters: SearchFilters::default(),
+            result_mode: SearchResultMode::Sessions,
         };
         let filtered_search_options = PacketOptions {
             limit: 24,
@@ -2761,6 +2941,7 @@ mod tests {
                 file: Some("perf_profile.rs".into()),
                 ..SearchFilters::default()
             },
+            result_mode: SearchResultMode::Sessions,
         };
 
         let search_warmup = search_packet(&store, "perfneedle", &search_options).unwrap();
