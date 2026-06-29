@@ -18,6 +18,16 @@ ctx search "sqlite migration failed" --repo ctx --json
 ctx show event <ctx-event-id> --window 5 --format json
 ```
 
+Normal `ctx search` uses `--refresh auto`, which can import newly discovered
+provider history into the local ctx index before querying. Use
+`ctx search ... --refresh off --json` when the task requires a strictly
+read-only query over the existing index.
+
+When ctx runs inside Codex and `CODEX_THREAD_ID` is available, search excludes
+the active Codex session tree by default to avoid returning the current prompt
+or its subagent work as the top match. Use `--include-current-session` only when
+the active session tree is itself the target.
+
 ## History Research Reports
 
 Use the agent skill as a read-only research workflow when the task is to brief a
@@ -33,9 +43,9 @@ The agent writes the report from retrieved evidence; ctx does not synthesize
 reports. A practical command sequence is:
 
 ```bash
-ctx search "<topic>" --json
-ctx search "<topic variant>" --repo <repo> --json
-ctx search "<topic>" --session <ctx-session-id> --events --json
+ctx search "<topic>" --refresh off --json
+ctx search "<topic variant>" --repo <repo> --refresh off --json
+ctx search "<topic>" --session <ctx-session-id> --refresh off --json
 ctx show event <ctx-event-id> --window 5 --format json
 ctx show session <ctx-session-id> --format json
 ```

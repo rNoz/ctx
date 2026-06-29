@@ -240,8 +240,8 @@ Each result can include:
 - `title`;
 - `snippet`;
 - `rank`;
-- `result_scope`, either `session` for default session-diverse results or
-  `event` for dense event results;
+- `result_scope`, either `session` for a session-level result or `event` for an
+  event-level result;
 - `session_importance` for default session results;
 - `more_matches_in_session` for default session results;
 - `provider`;
@@ -265,9 +265,25 @@ Each result can include:
 - `error`, present when refresh failed but results were still served.
 
 `suggested_next_commands` can include `ctx show event`, `ctx show session`,
-`ctx search ... --session <ctx-session-id> --events`, `ctx locate event`,
-`ctx locate session`, and `ctx export session` command strings when the required
-ctx IDs are known.
+`ctx search ... --session <ctx-session-id>`, `ctx locate event`, and
+`ctx locate session` command strings when the required ctx IDs are known.
+
+When ctx can identify the active Codex provider session through
+`CODEX_THREAD_ID`, search filters include `exclude_provider_session` and omit
+that active session tree by default. Passing `--include-current-session` removes
+that filter.
+
+## MCP Tool Results
+
+`ctx mcp serve` exposes read-only MCP tools over stdio for status, sources,
+search, showing sessions, and showing events. Tool results include
+`structuredContent` JSON using the same private local fields as CLI JSON. MCP
+output may include absolute paths, source metadata, snippets, and transcript
+text, and the MCP host may log or forward it.
+
+MCP search does not refresh or import provider history. It also excludes the
+active Codex session tree by default when `CODEX_THREAD_ID` is set; pass
+`include_current_session: true` to opt back in.
 
 ## Citation Fields
 

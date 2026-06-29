@@ -52,16 +52,25 @@ Use this skill in two modes:
 
    ```bash
    ctx search "<query>" --json
+   ctx search "<query>" --refresh off --json
    ctx search "<query>" --provider codex --json
    ctx search "<query>" --repo <repo> --json
    ctx search "<query>" --file <path> --json
    ctx search "<query>" --since 30d --json
-   ctx search "<query>" --session <ctx-session-id> --events --json
+   ctx search "<query>" --session <ctx-session-id> --json
    ```
 
    Use default `ctx search` to find promising sessions. Use scoped
-   `ctx search ... --session <ctx-session-id> --events` when a session looks
+   `ctx search ... --session <ctx-session-id>` when a session looks
    relevant and you need dense event-level matches from that session.
+   Normal search may refresh the local ctx index before querying; use
+   `--refresh off` when the prompt requires strictly read-only research over the
+   existing index.
+
+   In Codex, ctx excludes the active session tree by default when
+   `CODEX_THREAD_ID` is available, so the current prompt and subagents do not
+   dominate historical retrieval. Use `--include-current-session` only when the
+   active session tree is the target.
 
 5. Inspect the best cited result before relying on it:
 
@@ -80,7 +89,7 @@ Use this skill in two modes:
 7. Export a transcript only when another agent or artifact needs a file:
 
    ```bash
-   ctx export session <ctx-session-id> --format markdown --out /tmp/ctx-session.md
+   ctx export session <ctx-session-id> --format markdown --out <output-path>
    ```
 
 ## History Research Reports
@@ -95,7 +104,8 @@ material.
 2. Run several targeted searches. Vary query terms across user wording, file or
    module names, error text, commands, branch names, and decision terms. Start
    with default `ctx search`, then narrow with `--repo`, `--provider`, `--file`,
-   `--since`, or `--session <ctx-session-id> --events`.
+   `--since`, or `--session <ctx-session-id>`.
+   Add `--refresh off` when the report must not update the local ctx index.
 3. Inspect focused sources before drawing conclusions. Prefer `ctx show event`
    for a hit plus nearby turns, and `ctx show session` when the whole session
    arc matters:

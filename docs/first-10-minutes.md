@@ -70,8 +70,12 @@ ctx search "build failure" --limit 5 --json
 ```
 
 `--limit` is capped at `200`. Search defaults to `--refresh auto`, which
-best-effort refreshes discovered Codex session sources before querying; use
+best-effort refreshes discovered native provider sources before querying; use
 `--refresh off` to search only the existing index.
+
+Inside Codex, ctx excludes the active session tree by default when it can
+identify it, so your current prompt and subagents do not dominate results. Add
+`--include-current-session` when that is what you want to search.
 
 Copy ctx-owned IDs from the result and inspect the hit or transcript:
 

@@ -9,8 +9,8 @@ the local retrieval product.
   ctx data root and SQLite index.
 - `ctx sources` writes nothing in local-only security mode.
 - `ctx import` writes only the configured ctx data root and SQLite index.
-- `ctx search` may refresh discovered Codex session history into the configured
-  ctx data root before querying.
+- `ctx search` may refresh discovered native provider history into the
+  configured ctx data root before querying.
 - `ctx list`, `ctx show`, and `ctx locate` write nothing in local-only security
   mode.
 - `ctx export session` writes only the explicit `--out` path when one is

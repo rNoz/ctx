@@ -235,6 +235,7 @@ struct ExportSessionArgs {
 
 #[derive(Debug, Args)]
 struct SearchArgs {
+    #[arg(help = "Natural-language query to search local agent history")]
     query: Option<String>,
     #[arg(
         long,
@@ -243,21 +244,27 @@ struct SearchArgs {
         help = "Maximum results to return, from 1 to 200"
     )]
     limit: usize,
-    #[arg(long)]
+    #[arg(long, help = "Search only one provider")]
     provider: Option<ProviderArg>,
-    #[arg(long)]
+    #[arg(long, help = "Filter by repository/workspace path text")]
     repo: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Filter to recent history, as RFC3339 or a day window like 30d"
+    )]
     since: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Return only primary-agent sessions")]
     primary_only: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Include subagent sessions; this is the default unless --primary-only is set"
+    )]
     include_subagents: bool,
-    #[arg(long)]
+    #[arg(long, help = "Filter by event type, such as message or tool_call")]
     event_type: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Filter by file path text")]
     file: Option<PathBuf>,
-    #[arg(long, help = "Search only within one ctx session id")]
+    #[arg(long, help = "Search event hits within one ctx session id")]
     session: Option<Uuid>,
     #[arg(
         long,
@@ -272,7 +279,12 @@ struct SearchArgs {
         long_help = "Pre-search refresh behavior. auto best-effort refreshes discovered native provider sources and serves the existing index if refresh fails; off searches the existing index only; strict fails if the refresh cannot run or import successfully."
     )]
     refresh: RefreshArg,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Include the active Codex session tree when CODEX_THREAD_ID is set"
+    )]
+    include_current_session: bool,
+    #[arg(long, help = "Print machine-readable JSON")]
     json: bool,
 }
 
@@ -285,6 +297,7 @@ pub(crate) struct SearchFilterInput {
     include_subagents: bool,
     event_type: Option<String>,
     file: Option<PathBuf>,
+    include_current_session: bool,
 }
 
 impl CommandRoot {
@@ -435,9 +448,13 @@ enum ProviderArg {
     #[value(alias = "gemini-cli")]
     Gemini,
     Cursor,
-    #[value(alias = "copilot")]
+    #[value(alias = "copilot", alias = "copilot_cli")]
     CopilotCli,
-    #[value(alias = "factoryai-droid", alias = "factory-droid")]
+    #[value(
+        alias = "factoryai-droid",
+        alias = "factory-droid",
+        alias = "factory_ai_droid"
+    )]
     FactoryAiDroid,
 }
 
@@ -461,6 +478,20 @@ impl ProviderArg {
             Self::Cursor => CaptureProvider::Cursor,
             Self::CopilotCli => CaptureProvider::CopilotCli,
             Self::FactoryAiDroid => CaptureProvider::FactoryAiDroid,
+        }
+    }
+
+    pub(crate) fn cli_name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+            Self::Claude => "claude",
+            Self::OpenCode => "opencode",
+            Self::Antigravity => "antigravity",
+            Self::Gemini => "gemini",
+            Self::Cursor => "cursor",
+            Self::CopilotCli => "copilot-cli",
+            Self::FactoryAiDroid => "factory-ai-droid",
         }
     }
 }
@@ -1207,9 +1238,18 @@ fn command_analytics_properties(command: &CommandRoot) -> AnalyticsProperties {
                 "has_session_filter",
                 args.session.is_some(),
             );
-            analytics::insert_bool(&mut properties, "event_results", args.events);
+            analytics::insert_bool(
+                &mut properties,
+                "event_results",
+                args.events || args.session.is_some(),
+            );
             analytics::insert_bool(&mut properties, "primary_only", args.primary_only);
             analytics::insert_bool(&mut properties, "include_subagents", args.include_subagents);
+            analytics::insert_bool(
+                &mut properties,
+                "include_current_session",
+                args.include_current_session,
+            );
             analytics::insert_count_bucket(&mut properties, "limit_bucket", args.limit as u64);
             if let Some(provider) = args.provider {
                 analytics::insert_str(
@@ -3118,14 +3158,21 @@ fn search_next_commands(
     if result.result_scope == ctx_history_search::SearchResultScope::Session {
         if let Some(id) = result.session_id {
             commands.push(format!("ctx show session {id}"));
+            if let Some(event_id) = result.event_id {
+                commands.push(format!("ctx show event {event_id} --window 10"));
+            }
             if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
                 commands.push(format!(
-                    "ctx search {} --session {id} --events",
-                    shell_quote(query)
+                    "ctx search {} --session {id}",
+                    shell_quote_arg(query)
                 ));
             }
             commands.push(format!("ctx locate session {id}"));
+            if let Some(event_id) = result.event_id {
+                commands.push(format!("ctx locate event {event_id}"));
+            }
         }
+        return commands;
     }
     if let Some(id) = result.event_id {
         commands.push(format!("ctx show event {id} --window 10"));
@@ -3135,22 +3182,15 @@ fn search_next_commands(
         if let Some(id) = result.session_id {
             if let Some(query) = query.filter(|query| !query.trim().is_empty()) {
                 commands.push(format!(
-                    "ctx search {} --session {id} --events",
-                    shell_quote(query)
+                    "ctx search {} --session {id}",
+                    shell_quote_arg(query)
                 ));
             }
             commands.push(format!("ctx show session {id}"));
             commands.push(format!("ctx locate session {id}"));
-            commands.push(format!(
-            "ctx export session {id} --mode full --format markdown --out /tmp/ctx-session-{id}.md"
-        ));
         }
     }
     commands
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("{value:?}")
 }
 
 fn public_citations(citations: &[ContextCitation]) -> Vec<Value> {
@@ -3286,19 +3326,24 @@ fn run_search(
     let refresh = refresh_before_search(&args, &data_root)?;
     let store = Store::open(database_path(data_root))?;
     let query = args.query.unwrap_or_default();
+    let event_results = args.events || args.session.is_some();
     let options = ctx_history_search::PacketOptions {
         limit: args.limit,
-        filters: search_filters(SearchFilterInput {
-            session: args.session,
-            provider: args.provider,
-            repo: args.repo.clone(),
-            since: args.since.clone(),
-            primary_only: args.primary_only,
-            include_subagents: args.include_subagents,
-            event_type: args.event_type.clone(),
-            file: args.file.clone(),
-        })?,
-        result_mode: if args.events {
+        filters: search_filters(
+            SearchFilterInput {
+                session: args.session,
+                provider: args.provider,
+                repo: args.repo.clone(),
+                since: args.since.clone(),
+                primary_only: args.primary_only,
+                include_subagents: args.include_subagents,
+                event_type: args.event_type.clone(),
+                file: args.file.clone(),
+                include_current_session: args.include_current_session,
+            },
+            Some(&store),
+        )?,
+        result_mode: if event_results {
             ctx_history_search::SearchResultMode::Events
         } else {
             ctx_history_search::SearchResultMode::Sessions
@@ -4381,7 +4426,15 @@ fn raw_retention_json(retention: ProviderRawRetention) -> &'static str {
     }
 }
 
-fn search_filters(input: SearchFilterInput) -> Result<ctx_history_search::SearchFilters> {
+fn search_filters(
+    input: SearchFilterInput,
+    store: Option<&Store>,
+) -> Result<ctx_history_search::SearchFilters> {
+    let exclude_provider_session = if input.include_current_session || input.session.is_some() {
+        None
+    } else {
+        current_codex_provider_session_filter(store)
+    };
     Ok(ctx_history_search::SearchFilters {
         session: input.session,
         provider: input.provider.map(ProviderArg::capture_provider),
@@ -4396,6 +4449,30 @@ fn search_filters(input: SearchFilterInput) -> Result<ctx_history_search::Search
             .transpose()
             .map_err(|err| anyhow!("{err}"))?,
         file: input.file.map(|path| path.display().to_string()),
+        exclude_provider_session,
+    })
+}
+
+fn current_codex_provider_session_filter(
+    store: Option<&Store>,
+) -> Option<ctx_history_search::ProviderSessionFilter> {
+    let provider_session_id = std::env::var("CODEX_THREAD_ID").ok()?;
+    let provider_session_id = provider_session_id.trim();
+    if provider_session_id.is_empty() {
+        return None;
+    }
+    let session_id = store
+        .and_then(|store| {
+            store
+                .session_by_external_session(CaptureProvider::Codex, provider_session_id)
+                .ok()
+                .flatten()
+        })
+        .map(|session| session.id);
+    Some(ctx_history_search::ProviderSessionFilter {
+        provider: CaptureProvider::Codex,
+        provider_session_id: provider_session_id.to_owned(),
+        session_id,
     })
 }
 
@@ -4430,4 +4507,18 @@ fn mark_share_safe(value: &mut Value) {
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote_arg;
+
+    #[test]
+    fn shell_quote_arg_uses_single_quotes_for_shell_metacharacters() {
+        assert_eq!(shell_quote_arg("onboarding"), "onboarding");
+        assert_eq!(
+            shell_quote_arg("$(touch /tmp/ctx-owned)'s"),
+            "'$(touch /tmp/ctx-owned)'\\''s'"
+        );
+    }
 }

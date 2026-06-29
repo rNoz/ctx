@@ -181,6 +181,8 @@ pub struct EventSearchHit {
     pub event_id: Uuid,
     pub history_record_id: Option<Uuid>,
     pub session_id: Option<Uuid>,
+    pub session_parent_session_id: Option<Uuid>,
+    pub session_root_session_id: Option<Uuid>,
     pub run_id: Option<Uuid>,
     pub seq: u64,
     pub event_type: EventType,
@@ -836,10 +838,7 @@ impl Store {
         let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         configure_read_only_connection(&conn, BUSY_TIMEOUT)?;
         let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if user_version > SCHEMA_VERSION {
-            return Err(StoreError::UnsupportedSchemaVersion(user_version));
-        }
-        if user_version < 1 {
+        if user_version != SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchemaVersion(user_version));
         }
         Ok(Self {
@@ -1763,6 +1762,24 @@ impl Store {
             )
             .optional()?
             .ok_or(StoreError::NotFound(id))
+    }
+
+    pub fn session_by_external_session(
+        &self,
+        provider: CaptureProvider,
+        external_session_id: &str,
+    ) -> Result<Option<Session>> {
+        self.conn
+            .query_row(
+                session_select_sql(
+                    "WHERE provider = ?1 AND external_session_id = ?2 ORDER BY started_at_ms DESC LIMIT 1",
+                )
+                .as_str(),
+                params![provider.as_str(), external_session_id],
+                session_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     pub fn sessions_for_record(&self, record_id: Uuid) -> Result<Vec<Session>> {
@@ -3063,6 +3080,8 @@ impl Store {
                    bm25(event_search),
                    COALESCE(s.provider, rs.provider, event_source.provider, session_source.provider, run_source.provider),
                    COALESCE(s.external_session_id, rs.external_session_id),
+                   COALESCE(s.parent_session_id, rs.parent_session_id),
+                   COALESCE(s.root_session_id, rs.root_session_id),
                    COALESCE(s.agent_type, rs.agent_type),
                    COALESCE(s.is_primary, rs.is_primary),
                    COALESCE(event_source.cwd, session_source.cwd, run_source.cwd),
@@ -3089,8 +3108,8 @@ impl Store {
         let rows = stmt.query_map(
             params![match_query, limit.max(1) as i64, offset as i64],
             |row| {
-                let payload_json = row.get::<_, String>(16)?;
-                let source_metadata_json = row.get::<_, Option<String>>(17)?;
+                let payload_json = row.get::<_, String>(18)?;
+                let source_metadata_json = row.get::<_, Option<String>>(19)?;
                 Ok(EventSearchHit {
                     event_id: parse_uuid(row.get::<_, String>(0)?)?,
                     history_record_id: parse_optional_uuid(row.get(1)?)?,
@@ -3104,14 +3123,16 @@ impl Store {
                     score: row.get(9)?,
                     provider: parse_optional_text_enum::<CaptureProvider>(row.get(10)?)?,
                     session_external_session_id: row.get(11)?,
-                    agent_type: parse_optional_text_enum::<AgentType>(row.get(12)?)?,
-                    session_is_primary: row.get::<_, Option<i64>>(13)?.map(|value| value != 0),
-                    cwd: row.get(14)?,
-                    raw_source_path: row.get(15)?,
+                    session_parent_session_id: parse_optional_uuid(row.get(12)?)?,
+                    session_root_session_id: parse_optional_uuid(row.get(13)?)?,
+                    agent_type: parse_optional_text_enum::<AgentType>(row.get(14)?)?,
+                    session_is_primary: row.get::<_, Option<i64>>(15)?.map(|value| value != 0),
+                    cwd: row.get(16)?,
+                    raw_source_path: row.get(17)?,
                     cursor: event_search_cursor(&payload_json, source_metadata_json.as_deref())?,
-                    record_title: row.get(18)?,
-                    record_kind: row.get(19)?,
-                    record_workspace: row.get(20)?,
+                    record_title: row.get(20)?,
+                    record_kind: row.get(21)?,
+                    record_workspace: row.get(22)?,
                 })
             },
         )?;

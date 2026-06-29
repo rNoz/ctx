@@ -78,7 +78,8 @@ For a read-only research subagent, ask for a report explicitly:
 ```text
 Use ctx to research prior local agent sessions about <topic>. Run multiple
 searches, inspect focused events or sessions, and return a concise report with
-ctx citations. Do not edit files.
+ctx citations. Use --refresh off if the report must not update the local ctx
+index. Do not edit files.
 ```
 
 See [Agent History Search Skill](https://ctx.rs/agent-history-search-skill) for the installable skill, prompt pattern, and agent-specific setup links.

@@ -73,6 +73,16 @@ pub struct SearchFilters {
     pub event_type: Option<EventType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_provider_session: Option<ProviderSessionFilter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderSessionFilter {
+    pub provider: ctx_history_core::CaptureProvider,
+    pub provider_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
 }
 
 impl Default for SearchFilters {
@@ -86,6 +96,7 @@ impl Default for SearchFilters {
             include_subagents: true,
             event_type: None,
             file: None,
+            exclude_provider_session: None,
         }
     }
 }
@@ -200,6 +211,8 @@ struct HitMetadata {
     provider: Option<ctx_history_core::CaptureProvider>,
     provider_session_id: Option<String>,
     session_id: Option<Uuid>,
+    parent_session_id: Option<Uuid>,
+    root_session_id: Option<Uuid>,
     event_id: Option<Uuid>,
     event_seq: Option<u64>,
     cwd: Option<String>,
@@ -311,6 +324,7 @@ fn candidate_search_result(
             &candidate.context,
             query,
             options.snippet_chars,
+            &options.filters,
         ),
         rank: candidate.score,
         result_scope: SearchResultScope::Event,
@@ -376,22 +390,15 @@ fn fast_event_search_packet(
 
     loop {
         pages_scanned = pages_scanned.saturating_add(1);
-        let hits = if filtered {
-            store.search_event_hits_page(query, page_size, offset)?
-        } else {
-            store.search_event_hits(query, page_size)?
-        };
+        let hits = store.search_event_hits_page(query, page_size, offset)?;
         let page_len = hits.len();
 
         for hit in hits {
             if !event_hit_matches_filters(&hit, &options.filters) {
                 continue;
             }
-            let result = event_search_result(&hit, query, options.snippet_chars);
             if clustered {
-                let cluster_id = result
-                    .session_id
-                    .unwrap_or(result.event_id.unwrap_or(result.record_id));
+                let cluster_id = hit.session_id.unwrap_or(hit.event_id);
                 if let Some(index) = clustered_index.get(&cluster_id).copied() {
                     let existing = &mut clustered_results[index];
                     existing.more_matches_in_session =
@@ -399,7 +406,7 @@ fn fast_event_search_packet(
                     existing.session_importance =
                         session_importance(existing.rank, existing.more_matches_in_session);
                 } else {
-                    let mut result = result;
+                    let mut result = event_search_result(&hit, query, options.snippet_chars);
                     result.result_scope = if result.session_id.is_some() {
                         SearchResultScope::Session
                     } else {
@@ -413,6 +420,7 @@ fn fast_event_search_packet(
                     break;
                 }
             } else {
+                let result = event_search_result(&hit, query, options.snippet_chars);
                 results.push(result);
                 if results.len() >= target_results {
                     break;
@@ -494,6 +502,9 @@ fn event_hit_matches_filters(hit: &EventSearchHit, filters: &SearchFilters) -> b
             return false;
         }
     }
+    if event_hit_matches_excluded_provider_session(hit, filters) {
+        return false;
+    }
     if let Some(provider) = filters.provider {
         if hit.provider != Some(provider) {
             return false;
@@ -540,6 +551,75 @@ fn event_hit_matches_filters(hit: &EventSearchHit, filters: &SearchFilters) -> b
         }
     }
     true
+}
+
+fn event_hit_matches_excluded_provider_session(
+    hit: &EventSearchHit,
+    filters: &SearchFilters,
+) -> bool {
+    filters
+        .exclude_provider_session
+        .as_ref()
+        .is_some_and(|excluded| {
+            (hit.provider == Some(excluded.provider)
+                && hit.session_external_session_id.as_deref()
+                    == Some(excluded.provider_session_id.as_str()))
+                || excluded_session_tree_matches(
+                    excluded,
+                    hit.session_id,
+                    hit.session_parent_session_id,
+                    hit.session_root_session_id,
+                )
+        })
+}
+
+fn hit_matches_excluded_provider_session(hit: &HitMetadata, filters: &SearchFilters) -> bool {
+    filters
+        .exclude_provider_session
+        .as_ref()
+        .is_some_and(|excluded| {
+            (hit.provider == Some(excluded.provider)
+                && hit.provider_session_id.as_deref()
+                    == Some(excluded.provider_session_id.as_str()))
+                || excluded_session_tree_matches(
+                    excluded,
+                    hit.session_id,
+                    hit.parent_session_id,
+                    hit.root_session_id,
+                )
+        })
+}
+
+fn context_has_excluded_provider_session(context: &RecordContext, filters: &SearchFilters) -> bool {
+    filters
+        .exclude_provider_session
+        .as_ref()
+        .is_some_and(|excluded| {
+            context.sessions.iter().any(|session| {
+                (session.provider == excluded.provider
+                    && session.external_session_id.as_deref()
+                        == Some(excluded.provider_session_id.as_str()))
+                    || excluded_session_tree_matches(
+                        excluded,
+                        Some(session.id),
+                        session.parent_session_id,
+                        session.root_session_id,
+                    )
+            })
+        })
+}
+
+fn excluded_session_tree_matches(
+    excluded: &ProviderSessionFilter,
+    session_id: Option<Uuid>,
+    parent_session_id: Option<Uuid>,
+    root_session_id: Option<Uuid>,
+) -> bool {
+    excluded.session_id.is_some_and(|excluded_session_id| {
+        session_id == Some(excluded_session_id)
+            || parent_session_id == Some(excluded_session_id)
+            || root_session_id == Some(excluded_session_id)
+    })
 }
 
 fn event_search_result(
@@ -795,7 +875,7 @@ fn candidate_for_record(
     if !record_matches_filters(&record, &context, filters) {
         return Ok(None);
     }
-    let analysis = analyze_record(&record, &context, terms);
+    let analysis = analyze_record(&record, &context, terms, filters);
     if terms.is_empty() || analysis.score > 0.0 {
         Ok(Some(Candidate {
             record,
@@ -884,6 +964,7 @@ fn analyze_record(
     record: &HistoryRecord,
     context: &RecordContext,
     terms: &[String],
+    filters: &SearchFilters,
 ) -> MatchAnalysis {
     let mut score = 0.0_f32;
     let mut why = Vec::new();
@@ -918,7 +999,10 @@ fn analyze_record(
 
     let mut primary_hit = None;
     let mut primary_weight = f32::MIN;
-    for section in search_sections(record, context) {
+    for section in search_sections(record, context, filters) {
+        if hit_matches_excluded_provider_session(&section.hit, filters) {
+            continue;
+        }
         if matches_terms(&section.text, terms) {
             score += section.weight;
             if section.weight > primary_weight {
@@ -966,7 +1050,11 @@ fn add_match(
     }
 }
 
-fn search_sections(record: &HistoryRecord, context: &RecordContext) -> Vec<SearchSection> {
+fn search_sections(
+    record: &HistoryRecord,
+    context: &RecordContext,
+    filters: &SearchFilters,
+) -> Vec<SearchSection> {
     let mut sections = Vec::new();
     let record_hit = empty_hit(record.updated_at);
     sections.push(SearchSection {
@@ -981,18 +1069,20 @@ fn search_sections(record: &HistoryRecord, context: &RecordContext) -> Vec<Searc
         ),
         hit: record_hit.clone(),
     });
-    sections.push(SearchSection {
-        reason: "primary_user_message",
-        weight: 5.0,
-        text: record.body.clone(),
-        citation: citation(
-            ContextCitationType::HistoryRecord,
-            record.id,
-            "session text",
-            record.updated_at,
-        ),
-        hit: record_hit.clone(),
-    });
+    if !context_has_excluded_provider_session(context, filters) {
+        sections.push(SearchSection {
+            reason: "primary_user_message",
+            weight: 5.0,
+            text: record.body.clone(),
+            citation: citation(
+                ContextCitationType::HistoryRecord,
+                record.id,
+                "session text",
+                record.updated_at,
+            ),
+            hit: record_hit.clone(),
+        });
+    }
     for tag in &record.tags {
         sections.push(SearchSection {
             reason: "tag",
@@ -1195,6 +1285,8 @@ fn empty_hit(time: chrono::DateTime<Utc>) -> HitMetadata {
         provider: None,
         provider_session_id: None,
         session_id: None,
+        parent_session_id: None,
+        root_session_id: None,
         event_id: None,
         event_seq: None,
         cwd: None,
@@ -1209,6 +1301,8 @@ fn session_hit(session: &Session, context: &RecordContext) -> HitMetadata {
     hit.provider = Some(session.provider);
     hit.provider_session_id = session.external_session_id.clone();
     hit.session_id = Some(session.id);
+    hit.parent_session_id = session.parent_session_id;
+    hit.root_session_id = session.root_session_id;
     if hit.cwd.is_none() {
         hit.cwd = source_for_id(session.capture_source_id, context)
             .and_then(|source| source.descriptor.cwd.clone());
@@ -1219,11 +1313,18 @@ fn session_hit(session: &Session, context: &RecordContext) -> HitMetadata {
 fn run_hit(run: &Run, context: &RecordContext) -> HitMetadata {
     let mut hit = source_hit(run.source_id, run.started_at, context);
     hit.session_id = run.session_id;
-    if hit.provider.is_none() {
-        hit.provider = run
-            .session_id
-            .and_then(|id| context.sessions.iter().find(|session| session.id == id))
-            .map(|session| session.provider);
+    if let Some(session) = run
+        .session_id
+        .and_then(|id| context.sessions.iter().find(|session| session.id == id))
+    {
+        if hit.provider.is_none() {
+            hit.provider = Some(session.provider);
+        }
+        if hit.provider_session_id.is_none() {
+            hit.provider_session_id = session.external_session_id.clone();
+        }
+        hit.parent_session_id = session.parent_session_id;
+        hit.root_session_id = session.root_session_id;
     }
     if hit.cwd.is_none() {
         hit.cwd = run.cwd.clone();
@@ -1246,6 +1347,8 @@ fn event_hit(event: &Event, context: &RecordContext) -> HitMetadata {
             if hit.provider_session_id.is_none() {
                 hit.provider_session_id = session.external_session_id.clone();
             }
+            hit.parent_session_id = session.parent_session_id;
+            hit.root_session_id = session.root_session_id;
         }
     }
     hit
@@ -1265,6 +1368,15 @@ fn file_hit(file: &FileTouched, context: &RecordContext) -> HitMetadata {
             .find(|event| event.id == id)
             .and_then(|event| event.session_id)
     });
+    if let Some(session) = hit
+        .session_id
+        .and_then(|id| context.sessions.iter().find(|session| session.id == id))
+    {
+        hit.provider = Some(session.provider);
+        hit.provider_session_id = session.external_session_id.clone();
+        hit.parent_session_id = session.parent_session_id;
+        hit.root_session_id = session.root_session_id;
+    }
     hit
 }
 
@@ -1282,6 +1394,8 @@ fn source_hit(
         provider: Some(source.descriptor.provider),
         provider_session_id: source.descriptor.external_session_id.clone(),
         session_id: None,
+        parent_session_id: None,
+        root_session_id: None,
         event_id: None,
         event_seq: None,
         cwd: source.descriptor.cwd.clone(),
@@ -1479,6 +1593,7 @@ fn has_filters(filters: &SearchFilters) -> bool {
             .file
             .as_ref()
             .is_some_and(|value| !value.trim().is_empty())
+        || filters.exclude_provider_session.is_some()
 }
 
 fn record_matches_filters(
@@ -1500,6 +1615,27 @@ fn record_matches_filters(
                 .iter()
                 .any(|run| run.session_id == Some(session_id))
         {
+            return false;
+        }
+    }
+
+    if let Some(excluded) = &filters.exclude_provider_session {
+        let matched_sessions = context
+            .sessions
+            .iter()
+            .filter(|session| {
+                (session.provider == excluded.provider
+                    && session.external_session_id.as_deref()
+                        == Some(excluded.provider_session_id.as_str()))
+                    || excluded_session_tree_matches(
+                        excluded,
+                        Some(session.id),
+                        session.parent_session_id,
+                        session.root_session_id,
+                    )
+            })
+            .count();
+        if matched_sessions > 0 && matched_sessions == context.sessions.len() {
             return false;
         }
     }
@@ -1625,14 +1761,18 @@ fn search_snippet(
     context: &RecordContext,
     query: &str,
     max_chars: usize,
+    filters: &SearchFilters,
 ) -> String {
     let terms = query_terms(query);
-    for section in search_sections(record, context) {
+    for section in search_sections(record, context, filters) {
+        if hit_matches_excluded_provider_session(&section.hit, filters) {
+            continue;
+        }
         if matches_terms(&section.text, &terms) {
             return matched_snippet(&section.text, &terms, max_chars);
         }
     }
-    if !record.body.trim().is_empty() {
+    if !record.body.trim().is_empty() && !context_has_excluded_provider_session(context, filters) {
         return safe_snippet(&record.body, max_chars);
     }
     String::new()
@@ -2283,6 +2423,136 @@ mod tests {
             SearchResultScope::Event
         );
         assert_eq!(event_packet.results[0].event_id, Some(target_event_id));
+    }
+
+    #[test]
+    fn clustered_fast_search_pages_past_dominant_first_session() {
+        let (_temp, store) = test_store();
+        let dominant_record = HistoryRecord::new(
+            "Dominant matching session",
+            "dominant record",
+            Vec::new(),
+            "agent_history",
+            Some("/workspace/ctx".into()),
+        );
+        store.insert_record(&dominant_record).unwrap();
+        let dominant_session = Session {
+            id: Uuid::parse_str("018f45d0-0000-7000-8000-000000000701").unwrap(),
+            history_record_id: Some(dominant_record.id),
+            parent_session_id: None,
+            root_session_id: None,
+            capture_source_id: None,
+            provider: CaptureProvider::Codex,
+            external_session_id: Some("dominant-session".into()),
+            external_agent_id: None,
+            agent_type: AgentType::Primary,
+            role_hint: Some("primary".into()),
+            is_primary: true,
+            status: SessionStatus::Imported,
+            transcript_blob_id: None,
+            started_at: fixed_time(),
+            ended_at: None,
+            timestamps: timestamps(),
+            sync: sync_metadata(),
+        };
+        store.upsert_session(&dominant_session).unwrap();
+
+        let later_record = HistoryRecord::new(
+            "Later matching session",
+            "later record",
+            Vec::new(),
+            "agent_history",
+            Some("/workspace/ctx".into()),
+        );
+        store.insert_record(&later_record).unwrap();
+        let later_session = Session {
+            id: Uuid::parse_str("018f45d0-0000-7000-8000-000000000702").unwrap(),
+            history_record_id: Some(later_record.id),
+            parent_session_id: None,
+            root_session_id: None,
+            capture_source_id: None,
+            provider: CaptureProvider::Codex,
+            external_session_id: Some("later-session".into()),
+            external_agent_id: None,
+            agent_type: AgentType::Primary,
+            role_hint: Some("primary".into()),
+            is_primary: true,
+            status: SessionStatus::Imported,
+            transcript_blob_id: None,
+            started_at: fixed_time(),
+            ended_at: None,
+            timestamps: timestamps(),
+            sync: sync_metadata(),
+        };
+        store.upsert_session(&later_session).unwrap();
+
+        for index in 0..=(LARGE_EVENT_CORPUS_THRESHOLD as u64) {
+            let (record_id, session_id, text, occurred_at) = if index < 600 {
+                (
+                    dominant_record.id,
+                    dominant_session.id,
+                    "cluster-paging-needle dominant hit",
+                    fixed_time() + chrono::Duration::milliseconds(2_000 - index as i64),
+                )
+            } else if index == 600 {
+                (
+                    later_record.id,
+                    later_session.id,
+                    "cluster-paging-needle later hit",
+                    fixed_time(),
+                )
+            } else {
+                (
+                    dominant_record.id,
+                    dominant_session.id,
+                    "ordinary large history event",
+                    fixed_time() - chrono::Duration::milliseconds(index as i64),
+                )
+            };
+            store
+                .upsert_event(&Event {
+                    id: Uuid::parse_str(&format!("018f45d0-0000-7000-8000-0000001{index:05x}"))
+                        .unwrap(),
+                    seq: 20_000 + index,
+                    history_record_id: Some(record_id),
+                    session_id: Some(session_id),
+                    run_id: None,
+                    event_type: EventType::Message,
+                    role: Some(EventRole::Assistant),
+                    occurred_at,
+                    capture_source_id: None,
+                    payload: serde_json::json!({
+                        "cursor": format!("line:{index}"),
+                        "body": { "text": text }
+                    }),
+                    payload_blob_id: None,
+                    dedupe_key: Some(format!("clustered-paging-{index}")),
+                    redaction_state: RedactionState::SafePreview,
+                    sync: sync_metadata(),
+                })
+                .unwrap();
+        }
+        store.refresh_search_index().unwrap();
+
+        let packet = search_packet(
+            &store,
+            "cluster-paging-needle",
+            &PacketOptions {
+                limit: 2,
+                snippet_chars: 200,
+                ..PacketOptions::default()
+            },
+        )
+        .unwrap();
+        let sessions = packet
+            .results
+            .iter()
+            .filter_map(|result| result.session_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(packet.results.len(), 2);
+        assert!(sessions.contains(&dominant_session.id));
+        assert!(sessions.contains(&later_session.id));
+        assert!(!packet.truncation.truncated);
     }
 
     #[test]

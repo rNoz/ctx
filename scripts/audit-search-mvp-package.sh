@@ -52,6 +52,7 @@ public_user_docs=(
   docs/*.md
   docs/contracts/*.md
   skills/ctx-agent-history-search/SKILL.md
+  plugins/ctx-agent-history-search/skills/ctx-agent-history-search/SKILL.md
 )
 
 if tracked_files | grep -E '^apps/ctx-dashboard(/|$)' >/dev/null; then
@@ -84,8 +85,12 @@ if grep_files 'dashboard|shim|shims|pull request|pull-request|pr evidence|pr-evi
 fi
 
 if grep_files '/home/[d]addy|/home/[^[:space:]]+/(code|Documents|Desktop)|/Users/[^[:space:]]+/(code|Documents|Desktop)|ctx-[p]rivate|ctx-multi-repo-workspace|\.ctx/worktrees' \
-  .bazelignore .bazelrc .bazelversion .buildkite .gitignore README.md SECURITY.md docs skills scripts crates/ctx-cli/src >/dev/null 2>&1; then
+  .bazelignore .bazelrc .bazelversion .buildkite .gitignore README.md SECURITY.md docs skills plugins scripts crates/ctx-cli/src >/dev/null 2>&1; then
   fail 'public package surface contains private host or workspace paths'
+fi
+
+if ! diff -u skills/ctx-agent-history-search/SKILL.md plugins/ctx-agent-history-search/skills/ctx-agent-history-search/SKILL.md >/dev/null; then
+  fail 'plugin skill copy differs from public skill source'
 fi
 
 if grep_files '[W]ork Recorder|[w]ork recorder|ctx publish|ctx evidence|ctx pr|ctx link-pr|ctx context|ctx update|ctx uninstall|update checks|auto-update|update-state|auto_update|CTX_UPDATE|release manifest|dashboard export|gh CLI|GhCli|upsert_github|write-shim-command|write_shim_command|capture_shim_command|shim_command_envelope|\bADE\b|\b[Aa]mp\b|[Aa]mpcode' \

@@ -18,6 +18,7 @@ use super::{
 };
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const MCP_MAX_EVENT_WINDOW: usize = 50;
 
 #[derive(Debug, Args)]
 pub(crate) struct McpArgs {
@@ -27,7 +28,10 @@ pub(crate) struct McpArgs {
 
 #[derive(Debug, Subcommand)]
 enum McpCommand {
-    #[command(about = "Serve a read-only MCP server over stdio")]
+    #[command(
+        about = "Serve a read-only MCP server over stdio",
+        long_about = "Serve a read-only MCP server over newline-delimited stdio JSON-RPC.\n\nExample:\n  printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"client\",\"version\":\"0\"}}}' | ctx mcp serve"
+    )]
     Serve(McpServeArgs),
 }
 
@@ -44,6 +48,7 @@ fn serve_stdio(data_root: PathBuf) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
+    let mut initialized = false;
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -51,7 +56,7 @@ fn serve_stdio(data_root: PathBuf) -> Result<()> {
         if line.is_empty() {
             continue;
         }
-        if let Some(response) = handle_line(line, &data_root) {
+        if let Some(response) = handle_line(line, &data_root, &mut initialized) {
             writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
             stdout.flush()?;
         }
@@ -59,7 +64,7 @@ fn serve_stdio(data_root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn handle_line(line: &str, data_root: &Path) -> Option<Value> {
+fn handle_line(line: &str, data_root: &Path, initialized: &mut bool) -> Option<Value> {
     let message = match serde_json::from_str::<Value>(line) {
         Ok(message) => message,
         Err(err) => {
@@ -71,10 +76,17 @@ fn handle_line(line: &str, data_root: &Path) -> Option<Value> {
             ));
         }
     };
-    handle_message(message, data_root)
+    handle_message(message, data_root, initialized)
 }
 
-fn handle_message(message: Value, data_root: &Path) -> Option<Value> {
+fn handle_message(message: Value, data_root: &Path, initialized: &mut bool) -> Option<Value> {
+    let Some(object) = message.as_object() else {
+        return Some(error_response(Value::Null, -32600, "Invalid Request", None));
+    };
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        let id = object.get("id").cloned().unwrap_or(Value::Null);
+        return Some(error_response(id, -32600, "Invalid Request", None));
+    }
     let id = message
         .as_object()
         .and_then(|object| object.get("id"))
@@ -82,10 +94,38 @@ fn handle_message(message: Value, data_root: &Path) -> Option<Value> {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return id.map(|id| error_response(id, -32600, "Invalid Request", None));
     };
+    if matches!(id, Some(Value::Null | Value::Array(_) | Value::Object(_))) {
+        return Some(error_response(Value::Null, -32600, "Invalid Request", None));
+    }
+    if id.is_none() {
+        if method == "notifications/initialized" {
+            *initialized = true;
+        }
+        return None;
+    }
     let id = id?;
     let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+    if !params.is_object() {
+        return Some(error_response(
+            id,
+            -32602,
+            "Invalid params",
+            Some(json!({ "error": "params must be an object" })),
+        ));
+    }
+    if method != "initialize" && !*initialized {
+        return Some(error_response(
+            id,
+            -32002,
+            "Server not initialized",
+            Some(json!({ "error": "send initialize before calling ctx MCP tools" })),
+        ));
+    }
     let result = match method {
-        "initialize" => Ok(initialize_result()),
+        "initialize" => {
+            *initialized = true;
+            Ok(initialize_result())
+        }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
         "tools/call" => handle_tools_call(params, data_root),
@@ -121,7 +161,7 @@ fn initialize_result() -> Value {
             "name": "ctx",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Read-only access to the local ctx index. This minimal server supports initialize, ping, tools/list, and tools/call over newline-delimited stdio. It does not expose MCP resources or prompts, and tools do not import provider history, write provider files, or write repositories."
+        "instructions": "Read-only access to the local ctx index. Tool output is private local history and may include absolute paths, source metadata, snippets, and transcript text; MCP hosts may log or forward it. This minimal server supports initialize, ping, tools/list, and tools/call over newline-delimited stdio. It does not expose MCP resources or prompts, and tools do not import provider history, write provider files, or write repositories."
     })
 }
 
@@ -146,11 +186,42 @@ fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
     }
 
     let result = match name {
-        "status" => tool_status(data_root),
-        "sources" => tool_sources(),
-        "search" => tool_search(&arguments, data_root),
-        "show_session" => tool_show_session(&arguments, data_root),
-        "show_event" => tool_show_event(&arguments, data_root),
+        "status" => {
+            validate_argument_keys(&arguments, &[])?;
+            tool_status(data_root)
+        }
+        "sources" => {
+            validate_argument_keys(&arguments, &[])?;
+            tool_sources()
+        }
+        "search" => {
+            validate_argument_keys(
+                &arguments,
+                &[
+                    "query",
+                    "limit",
+                    "provider",
+                    "repo",
+                    "since",
+                    "primary_only",
+                    "include_subagents",
+                    "event_type",
+                    "file",
+                    "session",
+                    "events",
+                    "include_current_session",
+                ],
+            )?;
+            tool_search(&arguments, data_root)
+        }
+        "show_session" => {
+            validate_argument_keys(&arguments, &["ctx_session_id", "mode"])?;
+            tool_show_session(&arguments, data_root)
+        }
+        "show_event" => {
+            validate_argument_keys(&arguments, &["ctx_event_id", "before", "after", "window"])?;
+            tool_show_event(&arguments, data_root)
+        }
         _ => {
             return Err(json_rpc_error(
                 -32602,
@@ -233,23 +304,29 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
     let repo = optional_string(arguments, "repo")?;
     let since = optional_string(arguments, "since")?;
     let primary_only = optional_bool(arguments, "primary_only")?.unwrap_or(false);
-    let include_subagents = optional_bool(arguments, "include_subagents")?.unwrap_or(false);
+    let include_subagents = optional_bool(arguments, "include_subagents")?.unwrap_or(!primary_only);
     let event_type = optional_string(arguments, "event_type")?;
     let file = optional_string(arguments, "file")?.map(PathBuf::from);
-    let events = optional_bool(arguments, "events")?.unwrap_or(false);
+    let events = optional_bool(arguments, "events")?.unwrap_or(false) || session.is_some();
+    let include_current_session =
+        optional_bool(arguments, "include_current_session")?.unwrap_or(false);
 
     let options = ctx_history_search::PacketOptions {
         limit,
-        filters: search_filters(SearchFilterInput {
-            session,
-            provider,
-            repo,
-            since,
-            primary_only,
-            include_subagents,
-            event_type,
-            file,
-        })?,
+        filters: search_filters(
+            SearchFilterInput {
+                session,
+                provider,
+                repo,
+                since,
+                primary_only,
+                include_subagents,
+                event_type,
+                file,
+                include_current_session,
+            },
+            Some(&store),
+        )?,
         result_mode: if events {
             ctx_history_search::SearchResultMode::Events
         } else {
@@ -285,6 +362,14 @@ fn tool_show_event(arguments: &Value, data_root: &Path) -> Result<Value> {
     let before = optional_usize(arguments, "before")?.unwrap_or(0);
     let after = optional_usize(arguments, "after")?.unwrap_or(0);
     let window = optional_usize(arguments, "window")?;
+    if before > MCP_MAX_EVENT_WINDOW
+        || after > MCP_MAX_EVENT_WINDOW
+        || window.is_some_and(|window| window > MCP_MAX_EVENT_WINDOW)
+    {
+        return Err(anyhow!(
+            "show_event before/after/window must be {MCP_MAX_EVENT_WINDOW} or less"
+        ));
+    }
     let event = store.get_event(event_id)?;
     let events = event_window(&store, &event, before, after, window)?;
     Ok(event_window_json(
@@ -308,13 +393,11 @@ fn open_existing_store(data_root: &Path) -> Result<Store> {
 }
 
 fn tool_result(structured: Value) -> Value {
-    let text = serde_json::to_string_pretty(&structured)
-        .unwrap_or_else(|_| "{\"error\":\"failed to render JSON\"}".to_owned());
     json!({
         "content": [
             {
                 "type": "text",
-                "text": text,
+                "text": "ctx returned structured JSON in structuredContent. Treat it as private local history.",
             }
         ],
         "structuredContent": structured,
@@ -322,28 +405,18 @@ fn tool_result(structured: Value) -> Value {
 }
 
 fn tool_error_result(err: anyhow::Error) -> Value {
-    tool_result(json!({
-        "error": err.to_string(),
-    }))
-    .as_object()
-    .map(|object| {
-        let mut object = object.clone();
-        object.insert("isError".to_owned(), Value::Bool(true));
-        Value::Object(object)
-    })
-    .unwrap_or_else(|| {
-        json!({
-            "isError": true,
-            "content": [
-                {
-                    "type": "text",
-                    "text": err.to_string(),
-                }
-            ],
-            "structuredContent": {
-                "error": err.to_string(),
+    let error = err.to_string();
+    json!({
+        "isError": true,
+        "content": [
+            {
+                "type": "text",
+                "text": error.clone(),
             }
-        })
+        ],
+        "structuredContent": {
+            "error": error,
+        }
     })
 }
 
@@ -378,7 +451,8 @@ fn tool_definitions() -> Vec<Value> {
                 "event_type": { "type": "string", "enum": event_type_names() },
                 "file": { "type": "string" },
                 "session": { "type": "string", "description": "ctx session id." },
-                "events": { "type": "boolean", "default": false }
+                "events": { "type": "boolean", "default": false },
+                "include_current_session": { "type": "boolean", "default": false, "description": "Include the active Codex session tree when CODEX_THREAD_ID is set." }
             }), vec![]),
             "annotations": { "readOnlyHint": true },
         }),
@@ -417,17 +491,21 @@ fn object_schema(properties: Value, required: Vec<&str>) -> Value {
 }
 
 fn provider_names() -> Vec<&'static str> {
-    vec![
-        "codex",
-        "pi",
-        "claude",
-        "opencode",
-        "antigravity",
-        "gemini",
-        "cursor",
+    let mut names = vec![
+        ProviderArg::Codex.cli_name(),
+        ProviderArg::Pi.cli_name(),
+        ProviderArg::Claude.cli_name(),
+        ProviderArg::OpenCode.cli_name(),
+        ProviderArg::Antigravity.cli_name(),
+        ProviderArg::Gemini.cli_name(),
+        ProviderArg::Cursor.cli_name(),
+        ProviderArg::CopilotCli.cli_name(),
         "copilot_cli",
+        ProviderArg::FactoryAiDroid.cli_name(),
         "factory_ai_droid",
-    ]
+    ];
+    names.sort_unstable();
+    names
 }
 
 fn event_type_names() -> Vec<&'static str> {
@@ -499,13 +577,34 @@ fn optional_provider(arguments: &Value, key: &str) -> Result<Option<ProviderArg>
         "antigravity" => Ok(Some(ProviderArg::Antigravity)),
         "gemini" => Ok(Some(ProviderArg::Gemini)),
         "cursor" => Ok(Some(ProviderArg::Cursor)),
-        "copilot_cli" => Ok(Some(ProviderArg::CopilotCli)),
-        "factory_ai_droid" => Ok(Some(ProviderArg::FactoryAiDroid)),
+        "copilot-cli" | "copilot_cli" => Ok(Some(ProviderArg::CopilotCli)),
+        "factory-ai-droid" | "factory_ai_droid" => Ok(Some(ProviderArg::FactoryAiDroid)),
         _ => Err(anyhow!(
             "provider must be one of {}",
             provider_names().join(", ")
         )),
     }
+}
+
+fn validate_argument_keys(arguments: &Value, allowed: &[&str]) -> std::result::Result<(), Value> {
+    let Some(object) = arguments.as_object() else {
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params",
+            Some(json!({ "error": "tools/call params.arguments must be an object" })),
+        ));
+    };
+    if let Some(key) = object
+        .keys()
+        .find(|key| !allowed.iter().any(|allowed| allowed == &key.as_str()))
+    {
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params",
+            Some(json!({ "error": format!("unknown argument {key}") })),
+        ));
+    }
+    Ok(())
 }
 
 fn optional_transcript_mode(arguments: &Value, key: &str) -> Result<Option<TranscriptMode>> {

@@ -16,7 +16,7 @@ product boundary is retrieval, not interpretation.
   native source is currently importable.
 - `ctx import` indexes supported local transcript formats.
 - `ctx list` reports indexed session rows.
-- `ctx search` can refresh discovered Codex session sources before returning
+- `ctx search` can refresh discovered native provider sources before returning
   ranked local hits from the local index, with event IDs when a hit maps to an
   indexed event.
 - `ctx show session` and `ctx show event` render transcripts, hits, and context

@@ -87,13 +87,20 @@ Use `ctx_event_id` with `ctx show event` when you need a hit plus surrounding
 events. Use `ctx_session_id` with `ctx show session` when you need the
 transcript. Search also accepts filters such as `--provider`, `--repo`,
 `--since`, `--event-type`, `--file`, `--primary-only`, `--include-subagents`,
-`--limit`, and `--refresh auto|off|strict`. `--limit` is capped at `200`.
-Search defaults to `--refresh auto`, a best-effort refresh of discovered Codex
-session sources before querying. On large discovered sources or
+`--include-current-session`, `--limit`, and `--refresh auto|off|strict`.
+`--limit` is capped at `200`.
+Search defaults to `--refresh auto`, a best-effort refresh of discovered native
+provider sources before querying. On large discovered sources or
 already-cataloged indexes, `auto` serves current results without a foreground
 catch-up scan; use
-`--refresh strict` or `ctx import --provider codex` when you need a full
+`--refresh strict` or `ctx import --all` when you need a full
 catch-up before querying.
+
+When ctx runs inside Codex, search excludes the active Codex session tree by
+default when it can identify it. Use `--include-current-session` if the current
+session or its subagent work is the history you want to search. Use
+`--refresh off` when you need a strictly read-only query over the existing ctx
+index.
 
 ## 6. Use Search JSON For Agents
 

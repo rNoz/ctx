@@ -162,25 +162,34 @@ ctx search "tool output" --event-type tool_output
 ctx search --file crates/foo/src/lib.rs
 ctx search "token budget" --refresh off
 ctx search "token budget" --limit 5 --json
-ctx search "token budget" --session <ctx-session-id> --events --json
+ctx search "token budget" --session <ctx-session-id> --json
+ctx search "this current task" --include-current-session
 ```
 
-`search` defaults to `--refresh auto`, which quietly refreshes discovered Codex
-session sources before querying indexed sessions and events. The refresh is
+`search` defaults to `--refresh auto`, which quietly refreshes discovered native
+provider sources before querying indexed sessions and events. The refresh is
 best-effort and keeps JSON stdout reserved for the search result object. On
 large discovered sources or already-cataloged indexes, `auto` serves current
 results without a foreground catch-up scan; use `--refresh strict` or
-`ctx import --provider codex` when you need a full catch-up before querying.
-Use `--refresh off` to search the existing index without refreshing, or
+`ctx import --all` when you need a full catch-up before querying. Use
+`--refresh off` to search the existing index without refreshing, or
 `--refresh strict` to fail when the pre-search refresh cannot run or import
-successfully. The current pre-search refresh path is limited to discovered
-Codex session sources; other providers are searched from the existing index
-until they are explicitly imported. The query argument is optional so file or
-metadata filters can drive a search. Default results are session-diverse: ctx
+successfully. Search-only sources without native import support are searched
+from the existing index until they are explicitly imported through a supported
+path. The query argument is optional so file or metadata filters can drive a
+search. Default results are session-diverse: ctx
 returns the strongest matching span from each session, plus
 `more_matches_in_session` and `session_importance` when more indexed events from
-that session also matched. Use `--events` for dense event-level results, usually
-after scoping with `--session <ctx-session-id>`.
+that session also matched. Use `--session <ctx-session-id>` after a default
+search has identified a session to inspect; scoped session search returns dense
+event hits. Use `--events` without `--session` for dense event-level results
+across sessions.
+
+When ctx is run from Codex and `CODEX_THREAD_ID` is available, search excludes
+the active Codex session tree by default so the current task and its subagents
+do not dominate historical retrieval. Use `--include-current-session` to opt
+back in. Use `--refresh off` for a strictly read-only query over the existing
+ctx index.
 
 Results are local hits over indexed history. Event hits include `ctx_event_id`;
 hits with known session context include `ctx_session_id`; provider metadata
@@ -196,16 +205,17 @@ Filters:
 - `--since <rfc3339-or-days>d`, for example `2026-06-01T00:00:00Z` or `30d`;
 - `--event-type <event-type>`;
 - `--file <path>`;
-- `--session <ctx-session-id>`;
+- `--session <ctx-session-id>`, for dense event results within one session;
 - `--events`, for dense event-level results instead of the default session-diverse results;
 - `--primary-only`;
 - `--include-subagents`;
 - `--limit <n>`, capped at `200`;
-- `--refresh auto|off|strict`.
+- `--refresh auto|off|strict`;
+- `--include-current-session`.
 
-`search` reads Codex session files for pre-search refresh plus SQLite, and may
-write newly discovered Codex session history into the local index before
-querying.
+`search` reads discovered native provider files for pre-search refresh plus
+SQLite, and may write newly discovered native provider history into the local
+index before querying.
 
 ## MCP
 
@@ -216,8 +226,14 @@ ctx mcp serve
 `mcp serve` starts a read-only MCP server over newline-delimited stdio JSON-RPC.
 It exposes tools for `status`, `sources`, `search`, `show_session`, and
 `show_event`. The MCP search tool searches the existing index only; it does not
-refresh or import provider history. Tool results include both MCP text content
-and `structuredContent` JSON.
+refresh or import provider history. Tool results include MCP text content plus
+`structuredContent` JSON. Treat all MCP output as private local history: it may
+include absolute paths, source metadata, snippets, and transcript text, and the
+MCP host may log or forward tool output.
+
+MCP search follows the same active Codex session-tree exclusion as the CLI when
+`CODEX_THREAD_ID` is set. Pass `include_current_session: true` to the search
+tool when the active session tree itself is the target.
 
 The MCP server is optional. The CLI remains the primary interface, and MCP is
 intended for agents or hosts that prefer tool discovery over shell commands.

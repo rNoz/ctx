@@ -28,6 +28,7 @@ required_paths=(
   docs/redaction-corpus.md
   docs/agent-skill-install.md
   skills/ctx-agent-history-search/SKILL.md
+  plugins/ctx-agent-history-search/skills/ctx-agent-history-search/SKILL.md
 )
 
 for path in "${required_paths[@]}"; do
@@ -44,6 +45,7 @@ public_docs=(
   docs/*.md
   docs/contracts/*.md
   skills/ctx-agent-history-search/SKILL.md
+  plugins/ctx-agent-history-search/skills/ctx-agent-history-search/SKILL.md
 )
 
 analytics_scope=()
@@ -79,6 +81,11 @@ fi
 
 if scan_docs 'analytics|telemetry' "${analytics_scope[@]}"; then
   printf 'public analytics copy must stay limited to docs/storage.md\n' >&2
+  exit 1
+fi
+
+if ! diff -u skills/ctx-agent-history-search/SKILL.md plugins/ctx-agent-history-search/skills/ctx-agent-history-search/SKILL.md >/dev/null; then
+  printf 'plugin skill copy differs from public skill source\n' >&2
   exit 1
 fi
 
