@@ -1416,7 +1416,7 @@ fn mcp_search_and_show_tools_return_structured_json_without_refresh() {
     assert_eq!(event["item_type"], "event_window");
     assert_eq!(event["ctx_event_id"], ctx_event_id);
     assert_eq!(event["ctx_session_id"], ctx_session_id);
-    assert!(event["events"].as_array().unwrap().len() >= 1);
+    assert!(!event["events"].as_array().unwrap().is_empty());
 }
 
 #[test]

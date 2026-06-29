@@ -276,6 +276,17 @@ struct SearchArgs {
     json: bool,
 }
 
+pub(crate) struct SearchFilterInput {
+    session: Option<Uuid>,
+    provider: Option<ProviderArg>,
+    repo: Option<String>,
+    since: Option<String>,
+    primary_only: bool,
+    include_subagents: bool,
+    event_type: Option<String>,
+    file: Option<PathBuf>,
+}
+
 impl CommandRoot {
     fn name(&self) -> &'static str {
         match self {
@@ -3275,16 +3286,16 @@ fn run_search(
     let query = args.query.unwrap_or_default();
     let options = ctx_history_search::PacketOptions {
         limit: args.limit,
-        filters: search_filters(
-            args.session,
-            args.provider,
-            args.repo.clone(),
-            args.since.clone(),
-            args.primary_only,
-            args.include_subagents,
-            args.event_type.clone(),
-            args.file.clone(),
-        )?,
+        filters: search_filters(SearchFilterInput {
+            session: args.session,
+            provider: args.provider,
+            repo: args.repo.clone(),
+            since: args.since.clone(),
+            primary_only: args.primary_only,
+            include_subagents: args.include_subagents,
+            event_type: args.event_type.clone(),
+            file: args.file.clone(),
+        })?,
         result_mode: if args.events {
             ctx_history_search::SearchResultMode::Events
         } else {
@@ -4368,29 +4379,21 @@ fn raw_retention_json(retention: ProviderRawRetention) -> &'static str {
     }
 }
 
-fn search_filters(
-    session: Option<Uuid>,
-    provider: Option<ProviderArg>,
-    repo: Option<String>,
-    since: Option<String>,
-    primary_only: bool,
-    include_subagents: bool,
-    event_type: Option<String>,
-    file: Option<PathBuf>,
-) -> Result<ctx_history_search::SearchFilters> {
+fn search_filters(input: SearchFilterInput) -> Result<ctx_history_search::SearchFilters> {
     Ok(ctx_history_search::SearchFilters {
-        session,
-        provider: provider.map(ProviderArg::capture_provider),
-        repo,
-        since: since.as_deref().map(parse_since_filter).transpose()?,
-        primary_only,
-        include_subagents: include_subagents || !primary_only,
-        event_type: event_type
+        session: input.session,
+        provider: input.provider.map(ProviderArg::capture_provider),
+        repo: input.repo,
+        since: input.since.as_deref().map(parse_since_filter).transpose()?,
+        primary_only: input.primary_only,
+        include_subagents: input.include_subagents || !input.primary_only,
+        event_type: input
+            .event_type
             .as_deref()
             .map(EventType::from_str)
             .transpose()
             .map_err(|err| anyhow!("{err}"))?,
-        file: file.map(|path| path.display().to_string()),
+        file: input.file.map(|path| path.display().to_string()),
     })
 }
 

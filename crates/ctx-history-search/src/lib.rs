@@ -143,17 +143,12 @@ pub struct SearchPacketResult {
     pub visibility: Visibility,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchResultScope {
     Session,
+    #[default]
     Event,
-}
-
-impl Default for SearchResultScope {
-    fn default() -> Self {
-        Self::Event
-    }
 }
 
 fn is_default_result_scope(value: &SearchResultScope) -> bool {

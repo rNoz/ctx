@@ -13,8 +13,8 @@ use uuid::Uuid;
 use super::{
     compact_json, config::CONFIG_FILE, discovered_sources, event_window, event_window_json,
     indexed_history_item_count, mark_share_safe, search_filters, session_transcript_json,
-    sources_json, OutputFormat, ProviderArg, RefreshArg, SearchDto, SearchRefreshReport,
-    TranscriptMode, MAX_SEARCH_LIMIT,
+    sources_json, OutputFormat, ProviderArg, RefreshArg, SearchDto, SearchFilterInput,
+    SearchRefreshReport, TranscriptMode, MAX_SEARCH_LIMIT,
 };
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -82,9 +82,7 @@ fn handle_message(message: Value, data_root: &Path) -> Option<Value> {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return id.map(|id| error_response(id, -32600, "Invalid Request", None));
     };
-    let Some(id) = id else {
-        return None;
-    };
+    let id = id?;
     let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
     let result = match method {
         "initialize" => Ok(initialize_result()),
@@ -242,7 +240,7 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
 
     let options = ctx_history_search::PacketOptions {
         limit,
-        filters: search_filters(
+        filters: search_filters(SearchFilterInput {
             session,
             provider,
             repo,
@@ -251,7 +249,7 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
             include_subagents,
             event_type,
             file,
-        )?,
+        })?,
         result_mode: if events {
             ctx_history_search::SearchResultMode::Events
         } else {
