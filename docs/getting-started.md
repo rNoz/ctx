@@ -6,11 +6,11 @@ it repeats work.
 ## 1. Install The CLI
 
 ```bash
-curl -fsSL https://cli.ctx.rs/install | sh
+curl -fsSL https://ctx.rs/install | sh
 ```
 
 The Unix installer requires `curl` and OpenSSL to verify signed release
-metadata. On Windows, use `irm https://cli.ctx.rs/install.ps1 | iex`.
+metadata. On Windows, use `irm https://ctx.rs/install.ps1 | iex`.
 
 The install script installs `ctx` and runs `ctx setup` so discovered local
 history is indexed before it exits. Use `sh -s -- --no-setup` on Unix, or set

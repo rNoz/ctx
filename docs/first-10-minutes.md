@@ -12,11 +12,11 @@ ctx status
 If ctx is not installed:
 
 ```bash
-curl -fsSL https://cli.ctx.rs/install | sh
+curl -fsSL https://ctx.rs/install | sh
 ```
 
 The Unix installer requires `curl` and OpenSSL to verify signed release
-metadata. On Windows, use `irm https://cli.ctx.rs/install.ps1 | iex`.
+metadata. On Windows, use `irm https://ctx.rs/install.ps1 | iex`.
 
 ## 2. Set Up And Index
 
@@ -66,7 +66,7 @@ ctx import --provider cursor --path ~/.cursor/projects
 
 ```bash
 ctx search "build failure" --limit 5
-ctx search "build failure" --term buildkite --term release --limit 5
+ctx search "build failure" --term checksum --term release --limit 5
 ```
 
 `--limit` is capped at `200`. Search defaults to `--refresh auto`, which

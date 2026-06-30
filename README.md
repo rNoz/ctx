@@ -11,13 +11,17 @@ Those sessions are full of useful context:
 
 ctx indexes those logs into SQLite on your machine, then gives current and future agents a CLI for finding the prior discussion, command, or failed attempt before they repeat it.
 
-## Install
+## Install and set up the CLI
 
 ```bash
 curl -fsSL https://ctx.rs/install | sh
 ```
 
-Installs ctx and indexes discovered local agent history.
+## Install the agent skill
+
+```bash
+npx skills add ctxrs/ctx
+```
 
 ## How it works
 
@@ -32,23 +36,22 @@ ctx setup
 # Your agent can search prior work with normal language
 ctx search "failed migration"
 
-# Results are compact by default and include an inspect command
-# 1. codex session...
-#    codex | importance 4.23 | session 2f4a0b9c | event 9d01c8e1
-#    migration expected the old cursor name...
-#    inspect: ctx show event <ctx-event-id> --window 10
+# Or search several explicit terms when the wording changed
+ctx search --term "failed migration" --term rollback --term "cursor rename"
+
+# Results include matching sessions, snippets, and ctx IDs
+# evt_01h...  ses_01h...  codex  "migration expected the old cursor name" ...
 
 # Print the matching part of the old transcript
 ctx show event <ctx-event-id> --window 3
 
 # Or print a compact transcript of the original session
-ctx show session <ctx-session-id>
+ctx show session <ctx-session-id> --mode lite
 ```
 
-The inspect command lets your current agent recover as much context from
-previous sessions as needed.
+Those IDs let your current agent recover arbitrary amount of context from previous sessions as needed.
 
-The CLI does not send your prompts, transcripts, or indexed history to a cloud service, call model APIs, require API keys, or write into your source repositories.
+ctx does not send your prompts, transcripts, or indexed history to a cloud service, call model APIs, require API keys, or write into your source repositories.
 
 For the full pipeline, see [How ctx works](https://ctx.rs/concepts/how-it-works). For a quick first run, see [Quickstart](https://ctx.rs/first-search).
 
@@ -67,26 +70,15 @@ Support means ctx can discover or read that harness's persisted local history an
 | Factory AI Droid | Supported |
 | Copilot | Supported |
 
-## Install the skill
+## Install the ctx skill
 
-The agent-history search skill teaches an agent to use ctx before it edits or
-when it needs to research prior local sessions:
+After the CLI is installed, add the agent-history search skill so your agent knows when to search prior sessions and how to cite retrieved context:
 
-```text
-Search prior local agent sessions with ctx. Inspect the best event or session.
-If retrieved history affects your answer, cite the ctx ID you used.
+```bash
+npx skills add ctxrs/ctx
 ```
 
-For a read-only research subagent, ask for a report explicitly:
-
-```text
-Use ctx to research prior local agent sessions about <topic>. Run multiple
-searches, inspect focused events or sessions, and return a concise report with
-ctx citations. Use --refresh off if the report must not update the local ctx
-index. Do not edit files.
-```
-
-See [Agent History Search Skill](https://ctx.rs/agent-history-search-skill) for the installable skill, prompt pattern, and agent-specific setup links.
+The command uses the open `skills` installer to install `ctx-agent-history-search` into your agent. See [Install the ctx skill](https://ctx.rs/skill).
 
 ## How ctx compares
 
@@ -101,8 +93,8 @@ ctx keeps retrieval tied to sessions and events, so another agent can inspect th
 | Page | What it covers |
 | --- | --- |
 | [Install](https://ctx.rs/getting-started/install) | Install ctx, initialize local storage, and index discovered local history. |
-| [Quickstart](https://ctx.rs/first-search) | Search local history, inspect an event, open the session, and use script-friendly JSON only when needed. |
-| [Install the skill](https://ctx.rs/agent-history-search-skill) | Teach agents to search prior sessions, inspect cited hits, and report the ctx ID they used. |
+| [Quickstart](https://ctx.rs/first-search) | Search local history, inspect an event, open the session, and use JSON output. |
+| [Install the ctx skill](https://ctx.rs/skill) | Install the agent-history search skill with the open skills installer. |
 | [Cursor](https://ctx.rs/agents/cursor) | Import Cursor agent transcripts and ask Cursor to cite retrieved local history before editing. |
 | [How it works](https://ctx.rs/concepts/how-it-works) | Understand discovery, import, SQLite storage, search refresh, and cited retrieval. |
 | [Supported agents](https://ctx.rs/concepts/supported-agents) | See which agent histories ctx can discover, import, and search today. |

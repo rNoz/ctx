@@ -17,7 +17,7 @@ ctx search "retry handling" --workspace checkout --since 60d
 ctx search "tool output" --event-type tool_output
 ctx search --file crates/foo/src/lib.rs
 ctx search "token budget" --refresh off
-ctx search "signed metadata" --term buildkite --term release
+ctx search "signed metadata" --term checksum --term release
 ctx search "token budget" --limit 5
 ctx search "token budget" --session <ctx-session-id>
 ctx search "this current task" --include-current-session
