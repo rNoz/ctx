@@ -66,8 +66,6 @@ pub struct SearchFilters {
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<chrono::DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub until: Option<chrono::DateTime<Utc>>,
     #[serde(default)]
     pub primary_only: bool,
     #[serde(default)]
@@ -95,7 +93,6 @@ impl Default for SearchFilters {
             provider: None,
             repo: None,
             since: None,
-            until: None,
             primary_only: false,
             include_subagents: true,
             event_type: None,
@@ -698,11 +695,6 @@ fn event_hit_matches_filters(
     }
     if let Some(since) = filters.since {
         if hit.occurred_at < since {
-            return false;
-        }
-    }
-    if let Some(until) = filters.until {
-        if hit.occurred_at > until {
             return false;
         }
     }
@@ -1862,7 +1854,6 @@ fn has_filters(filters: &SearchFilters) -> bool {
             .as_ref()
             .is_some_and(|value| !value.trim().is_empty())
         || filters.since.is_some()
-        || filters.until.is_some()
         || filters.primary_only
         || !filters.include_subagents
         || filters.event_type.is_some()
@@ -1871,21 +1862,6 @@ fn has_filters(filters: &SearchFilters) -> bool {
             .as_ref()
             .is_some_and(|value| !value.trim().is_empty())
         || filters.exclude_provider_session.is_some()
-}
-
-fn time_matches_range(timestamp: chrono::DateTime<Utc>, filters: &SearchFilters) -> bool {
-    filters.since.map_or(true, |since| timestamp >= since)
-        && filters.until.map_or(true, |until| timestamp <= until)
-}
-
-fn interval_overlaps_range(
-    started_at: chrono::DateTime<Utc>,
-    ended_at: Option<chrono::DateTime<Utc>>,
-    filters: &SearchFilters,
-) -> bool {
-    let ended_at = ended_at.unwrap_or(started_at);
-    filters.since.map_or(true, |since| ended_at >= since)
-        && filters.until.map_or(true, |until| started_at <= until)
 }
 
 fn record_matches_filters(
@@ -1947,18 +1923,15 @@ fn record_matches_filters(
         }
     }
 
-    if filters.since.is_some() || filters.until.is_some() {
-        let matches_record_time = time_matches_range(record.updated_at, filters)
-            || time_matches_range(record.created_at, filters);
-        let matches_event_time = context
+    if let Some(since) = filters.since {
+        let has_recent_event = context
             .events
             .iter()
-            .any(|event| time_matches_range(event.occurred_at, filters));
-        let matches_session_time = context
-            .sessions
-            .iter()
-            .any(|session| interval_overlaps_range(session.started_at, session.ended_at, filters));
-        if !matches_record_time && !matches_event_time && !matches_session_time {
+            .any(|event| event.occurred_at >= since);
+        let has_recent_session = context.sessions.iter().any(|session| {
+            session.started_at >= since || session.ended_at.is_some_and(|ended| ended >= since)
+        });
+        if record.updated_at < since && !has_recent_event && !has_recent_session {
             return false;
         }
     }

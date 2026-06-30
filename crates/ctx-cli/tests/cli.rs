@@ -369,7 +369,7 @@ fn help_exposes_session_retrieval_commands() {
         .unwrap_or(&help);
 
     for expected in [
-        "setup", "status", "sources", "import", "show", "search", "web", "locate", "mcp", "doctor",
+        "setup", "status", "sources", "import", "show", "search", "locate", "mcp", "doctor",
     ] {
         assert!(
             commands.contains(expected),
@@ -926,8 +926,6 @@ fn public_subcommand_help_is_golden_enough_for_session_retrieval() {
                 "Filter by workspace path or name text",
                 "--since <SINCE>",
                 "Filter to recent history, as RFC3339 or a day window like 30d",
-                "--until <UNTIL>",
-                "Filter to history at or before this RFC3339 timestamp",
                 "--primary-only",
                 "Return only primary-agent sessions",
                 "--include-subagents",
@@ -946,18 +944,6 @@ fn public_subcommand_help_is_golden_enough_for_session_retrieval() {
                 "Print machine-readable JSON",
                 "--verbose",
                 "Print expanded text details",
-            ],
-        ),
-        (
-            "web",
-            vec![
-                "Usage: ctx web",
-                "--host <HOST>",
-                "Loopback host to bind",
-                "--port <PORT>",
-                "Port to serve the web UI on",
-                "--open",
-                "Open the web UI in the system browser after starting",
             ],
         ),
         ("doctor", vec!["Usage: ctx doctor", "--json"]),
@@ -1214,54 +1200,6 @@ fn fresh_home_search_mvp_flow() {
     assert_session_suggested_next_commands(first_result);
     assert!(first_result["citations"][0]["ctx_event_id"].is_string());
     assert!(first_result["citations"][0]["ctx_session_id"].is_string());
-
-    let event_until_seed = json_output(ctx(&temp).args([
-        "search",
-        "onboarding",
-        "--provider",
-        "codex",
-        "--refresh",
-        "off",
-        "--events",
-        "--json",
-    ]));
-    let result_timestamp = event_until_seed["results"][0]["timestamp"]
-        .as_str()
-        .unwrap();
-    let until_inclusive = json_output(ctx(&temp).args([
-        "search",
-        "onboarding",
-        "--provider",
-        "codex",
-        "--refresh",
-        "off",
-        "--events",
-        "--since",
-        result_timestamp,
-        "--until",
-        result_timestamp,
-        "--json",
-    ]));
-    assert_eq!(until_inclusive["results"].as_array().unwrap().len(), 1);
-    assert_eq!(until_inclusive["filters"]["until"], result_timestamp);
-    let before_result = (chrono::DateTime::parse_from_rfc3339(result_timestamp).unwrap()
-        - chrono::Duration::seconds(1))
-    .to_rfc3339();
-    let until_exclusive = json_output(ctx(&temp).args([
-        "search",
-        "onboarding",
-        "--provider",
-        "codex",
-        "--refresh",
-        "off",
-        "--events",
-        "--since",
-        result_timestamp,
-        "--until",
-        &before_result,
-        "--json",
-    ]));
-    assert!(until_exclusive["results"].as_array().unwrap().is_empty());
 
     let term_search = json_output(ctx(&temp).args([
         "search",
