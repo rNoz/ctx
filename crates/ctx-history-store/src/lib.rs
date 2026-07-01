@@ -1,9 +1,12 @@
 use std::{
     collections::{BTreeSet, HashMap},
+    ffi::CString,
     fs,
+    os::raw::c_char,
     path::{Path, PathBuf},
+    ptr,
     str::FromStr,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -17,7 +20,10 @@ use ctx_history_core::{
     SessionEdge, SessionHistoryArchive, SessionStatus, Summary, SyncCursor, SyncMetadata,
     SyncState, VcsChange, VcsWorkspace, Visibility,
 };
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{
+    ffi, limits::Limit, params, types::ValueRef, Connection, ErrorCode, OpenFlags,
+    OptionalExtension, Transaction,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -62,17 +68,127 @@ pub enum StoreError {
         existing_hash: String,
         new_hash: String,
     },
+    #[error("SQL query is empty")]
+    RawSqlEmpty,
+    #[error("SQL query contains an interior NUL byte")]
+    RawSqlInteriorNul,
+    #[error("SQL query must be read-only")]
+    RawSqlNotReadOnly,
+    #[error("SQL query parameters are not supported")]
+    RawSqlHasParameters,
+    #[error("SQL query must return at least one column")]
+    RawSqlNoColumns,
+    #[error("SQL query returned {columns} columns; maximum is {max_columns}")]
+    RawSqlTooManyColumns { columns: usize, max_columns: usize },
+    #[error("{field} must be between {min} and {max}, got {value}")]
+    RawSqlLimitOutOfRange {
+        field: &'static str,
+        value: usize,
+        min: usize,
+        max: usize,
+    },
+    #[error("SQL query timed out after {timeout_ms}ms")]
+    RawSqlTimedOut { timeout_ms: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const BUSY_TIMEOUT: Duration = Duration::from_millis(30_000);
 const OBJECTS_DIR: &str = "objects";
 const SPOOL_DIR: &str = "spool";
 const LEGACY_HISTORY_DIR_NAME: &str = "work-record";
 const LEGACY_BLOBS_DIR: &str = "blobs";
 const LEGACY_INBOX_DIR: &str = "inbox";
+pub const RAW_SQL_DEFAULT_MAX_ROWS: usize = 100;
+pub const RAW_SQL_MAX_ROWS_CAP: usize = 10_000;
+pub const RAW_SQL_DEFAULT_MAX_COLUMNS: usize = 64;
+pub const RAW_SQL_MAX_COLUMNS_CAP: usize = 256;
+pub const RAW_SQL_DEFAULT_MAX_VALUE_BYTES: usize = 512;
+pub const RAW_SQL_MAX_VALUE_BYTES_CAP: usize = 1_048_576;
+const RAW_SQL_MIN_SQLITE_LENGTH_LIMIT_BYTES: usize = 64 * 1024;
+const RAW_SQL_VALUE_LENGTH_MARGIN_BYTES: usize = 1024;
+pub const RAW_SQL_DEFAULT_MAX_SQL_BYTES: usize = 64 * 1024;
+pub const RAW_SQL_MAX_SQL_BYTES_CAP: usize = 1_048_576;
+pub const RAW_SQL_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const RAW_SQL_MAX_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawSqlOptions {
+    pub max_rows: usize,
+    pub max_columns: usize,
+    pub max_value_bytes: usize,
+    pub max_sql_bytes: usize,
+    pub timeout: Duration,
+}
+
+impl Default for RawSqlOptions {
+    fn default() -> Self {
+        Self {
+            max_rows: RAW_SQL_DEFAULT_MAX_ROWS,
+            max_columns: RAW_SQL_DEFAULT_MAX_COLUMNS,
+            max_value_bytes: RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
+            max_sql_bytes: RAW_SQL_DEFAULT_MAX_SQL_BYTES,
+            timeout: RAW_SQL_DEFAULT_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawSqlColumn {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawSqlValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text {
+        value: String,
+        bytes: usize,
+        truncated: bool,
+    },
+    Blob {
+        bytes: usize,
+        preview_hex: String,
+        truncated: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawSqlTruncation {
+    pub rows: bool,
+    pub values: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawSqlLimits {
+    pub max_rows: usize,
+    pub max_columns: usize,
+    pub max_value_bytes: usize,
+    pub max_sql_bytes: usize,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawSqlResult {
+    pub columns: Vec<RawSqlColumn>,
+    pub rows: Vec<Vec<RawSqlValue>>,
+    pub returned_rows: usize,
+    pub truncated: RawSqlTruncation,
+    pub elapsed: Duration,
+    pub limits: RawSqlLimits,
+}
+
+impl RawSqlValue {
+    fn is_truncated(&self) -> bool {
+        match self {
+            Self::Text { truncated, .. } | Self::Blob { truncated, .. } => *truncated,
+            Self::Null | Self::Integer(_) | Self::Real(_) => false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalDeviceIdentity {
@@ -838,6 +954,99 @@ CREATE VIRTUAL TABLE IF NOT EXISTS artifact_search USING fts5(
 );
 "#;
 
+const STABLE_SQL_VIEWS_SQL: &str = r#"
+DROP VIEW IF EXISTS ctx_sessions;
+CREATE VIEW ctx_sessions AS
+SELECT
+    s.id AS ctx_session_id,
+    s.history_record_id,
+    s.parent_session_id AS parent_ctx_session_id,
+    s.root_session_id AS root_ctx_session_id,
+    s.provider AS provider,
+    s.external_session_id AS provider_session_id,
+    s.external_agent_id AS external_agent_id,
+    s.agent_type AS agent_type,
+    s.role_hint AS role_hint,
+    s.is_primary AS is_primary,
+    s.status AS status,
+    s.fidelity AS fidelity,
+    s.started_at_ms AS started_at_ms,
+    s.ended_at_ms AS ended_at_ms,
+    cs.cwd AS cwd,
+    cs.raw_source_path AS source_path
+FROM sessions s
+LEFT JOIN capture_sources cs ON cs.id = s.capture_source_id
+WHERE s.deleted_at_ms IS NULL;
+
+DROP VIEW IF EXISTS ctx_events;
+CREATE VIEW ctx_events AS
+SELECT
+    e.id AS ctx_event_id,
+    e.session_id AS ctx_session_id,
+    e.history_record_id AS history_record_id,
+    s.provider AS provider,
+    s.external_session_id AS provider_session_id,
+    e.seq AS event_seq,
+    e.event_type AS event_type,
+    e.role AS role,
+    e.occurred_at_ms AS occurred_at_ms,
+    e.payload_json AS payload_json,
+    e.redaction_state AS redaction_state,
+    e.fidelity AS fidelity,
+    cs.cwd AS cwd,
+    cs.raw_source_path AS source_path
+FROM events e
+LEFT JOIN sessions s ON s.id = e.session_id
+LEFT JOIN capture_sources cs ON cs.id = e.capture_source_id
+WHERE e.deleted_at_ms IS NULL;
+
+DROP VIEW IF EXISTS ctx_files_touched;
+CREATE VIEW ctx_files_touched AS
+SELECT
+    ft.id AS ctx_file_touch_id,
+    ft.path AS path,
+    ft.old_path AS old_path,
+    ft.change_kind AS change_kind,
+    ft.line_count_delta AS line_count_delta,
+    ft.confidence AS confidence,
+    ft.event_id AS ctx_event_id,
+    COALESCE(e.session_id, r.session_id) AS ctx_session_id,
+    COALESCE(e.history_record_id, r.history_record_id, ft.history_record_id) AS history_record_id,
+    s.provider AS provider,
+    s.external_session_id AS provider_session_id,
+    ft.created_at_ms AS created_at_ms,
+    ft.updated_at_ms AS updated_at_ms
+FROM files_touched ft
+LEFT JOIN events e ON e.id = ft.event_id
+LEFT JOIN runs r ON r.id = ft.run_id
+LEFT JOIN sessions s ON s.id = COALESCE(e.session_id, r.session_id)
+WHERE ft.deleted_at_ms IS NULL;
+
+DROP VIEW IF EXISTS ctx_sources;
+CREATE VIEW ctx_sources AS
+SELECT
+    provider AS provider,
+    source_format AS source_format,
+    source_root AS source_root,
+    source_path AS source_path,
+    external_session_id AS provider_session_id,
+    parent_external_session_id AS parent_provider_session_id,
+    agent_type AS agent_type,
+    role_hint AS role_hint,
+    external_agent_id AS external_agent_id,
+    cwd AS cwd,
+    session_started_at_ms AS session_started_at_ms,
+    file_size_bytes AS file_size_bytes,
+    file_modified_at_ms AS file_modified_at_ms,
+    cataloged_at_ms AS cataloged_at_ms,
+    indexed_at_ms AS indexed_at_ms,
+    indexed_status AS indexed_status,
+    indexed_error AS indexed_error,
+    indexed_event_count AS indexed_event_count,
+    is_stale AS is_stale
+FROM catalog_sessions;
+"#;
+
 pub struct Store {
     path: PathBuf,
     object_dir: PathBuf,
@@ -907,6 +1116,103 @@ impl Store {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn raw_sql_query(&self, sql: &str, options: RawSqlOptions) -> Result<RawSqlResult> {
+        let sql = sql.trim();
+        if sql.is_empty() {
+            return Err(StoreError::RawSqlEmpty);
+        }
+        validate_raw_sql_options(&options)?;
+        validate_raw_sql_statement_bytes(sql, &options)?;
+        reject_sql_tail(&self.conn, sql)?;
+        let _limits = RawSqlLimitGuard::apply(&self.conn, &options)?;
+
+        let mut stmt = self.conn.prepare(sql)?;
+        if stmt.parameter_count() > 0 {
+            return Err(StoreError::RawSqlHasParameters);
+        }
+        if !stmt.readonly() {
+            return Err(StoreError::RawSqlNotReadOnly);
+        }
+        let column_count = stmt.column_count();
+        if column_count == 0 {
+            return Err(StoreError::RawSqlNoColumns);
+        }
+        if column_count > options.max_columns {
+            return Err(StoreError::RawSqlTooManyColumns {
+                columns: column_count,
+                max_columns: options.max_columns,
+            });
+        }
+
+        let columns = stmt
+            .column_names()
+            .into_iter()
+            .map(|name| RawSqlColumn {
+                name: name.to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let timeout = options.timeout;
+        let progress_started = started;
+        self.conn
+            .progress_handler(1_000, Some(move || progress_started.elapsed() >= timeout));
+
+        let query_result = (|| -> Result<RawSqlResult> {
+            let mut rows = stmt.query([])?;
+            let mut output_rows = Vec::new();
+            let mut rows_truncated = false;
+            let mut values_truncated = false;
+
+            while let Some(row) = rows.next()? {
+                if output_rows.len() >= options.max_rows {
+                    rows_truncated = true;
+                    break;
+                }
+                let mut output_row = Vec::with_capacity(column_count);
+                for index in 0..column_count {
+                    let value = raw_sql_value(row.get_ref(index)?, options.max_value_bytes);
+                    if value.is_truncated() {
+                        values_truncated = true;
+                    }
+                    output_row.push(value);
+                }
+                output_rows.push(output_row);
+            }
+
+            Ok(RawSqlResult {
+                returned_rows: output_rows.len(),
+                columns,
+                rows: output_rows,
+                truncated: RawSqlTruncation {
+                    rows: rows_truncated,
+                    values: values_truncated,
+                },
+                elapsed: started.elapsed(),
+                limits: RawSqlLimits {
+                    max_rows: options.max_rows,
+                    max_columns: options.max_columns,
+                    max_value_bytes: options.max_value_bytes,
+                    max_sql_bytes: options.max_sql_bytes,
+                    timeout_ms: duration_ms(options.timeout),
+                },
+            })
+        })();
+
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+
+        match query_result {
+            Err(StoreError::Sql(rusqlite::Error::SqliteFailure(error, _)))
+                if error.code == ErrorCode::OperationInterrupted
+                    && started.elapsed() >= options.timeout =>
+            {
+                Err(StoreError::RawSqlTimedOut {
+                    timeout_ms: duration_ms(options.timeout),
+                })
+            }
+            other => other,
+        }
     }
 
     pub fn begin_immediate_batch(&self) -> Result<()> {
@@ -1016,6 +1322,9 @@ impl Store {
         if user_version < 12 {
             migrate_to_v12(&self.conn)?;
         }
+        if user_version < 13 {
+            migrate_to_v13(&self.conn)?;
+        }
         create_fts_tables_if_supported(&self.conn)?;
         Ok(())
     }
@@ -1023,7 +1332,7 @@ impl Store {
     pub fn schema(&self) -> Result<String> {
         let mut stmt = self.conn.prepare(
             "SELECT sql FROM sqlite_master
-             WHERE type IN ('table', 'index') AND sql IS NOT NULL
+             WHERE type IN ('table', 'index', 'view') AND sql IS NOT NULL
              ORDER BY type, name",
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -3408,6 +3717,203 @@ fn configure_read_only_connection(conn: &Connection, busy_timeout: Duration) -> 
     Ok(())
 }
 
+fn validate_raw_sql_options(options: &RawSqlOptions) -> Result<()> {
+    validate_raw_sql_usize("max_rows", options.max_rows, 1, RAW_SQL_MAX_ROWS_CAP)?;
+    validate_raw_sql_usize(
+        "max_columns",
+        options.max_columns,
+        1,
+        RAW_SQL_MAX_COLUMNS_CAP,
+    )?;
+    validate_raw_sql_usize(
+        "max_value_bytes",
+        options.max_value_bytes,
+        1,
+        RAW_SQL_MAX_VALUE_BYTES_CAP,
+    )?;
+    validate_raw_sql_usize(
+        "max_sql_bytes",
+        options.max_sql_bytes,
+        1,
+        RAW_SQL_MAX_SQL_BYTES_CAP,
+    )?;
+    let timeout_ms = duration_ms(options.timeout);
+    if timeout_ms == 0 || options.timeout > RAW_SQL_MAX_TIMEOUT {
+        return Err(StoreError::RawSqlLimitOutOfRange {
+            field: "timeout_ms",
+            value: usize::try_from(timeout_ms).unwrap_or(usize::MAX),
+            min: 1,
+            max: usize::try_from(duration_ms(RAW_SQL_MAX_TIMEOUT)).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(())
+}
+
+fn validate_raw_sql_statement_bytes(sql: &str, options: &RawSqlOptions) -> Result<()> {
+    validate_raw_sql_usize("sql_bytes", sql.len(), 1, options.max_sql_bytes)
+}
+
+struct RawSqlLimitGuard<'a> {
+    conn: &'a Connection,
+    length: i32,
+    sql_length: i32,
+    column: i32,
+}
+
+impl<'a> RawSqlLimitGuard<'a> {
+    fn apply(conn: &'a Connection, options: &RawSqlOptions) -> Result<Self> {
+        let length_limit = raw_sql_length_limit(options)?;
+        let sql_length_limit = i32::try_from(options.max_sql_bytes).map_err(|_| {
+            StoreError::RawSqlLimitOutOfRange {
+                field: "max_sql_bytes",
+                value: options.max_sql_bytes,
+                min: 1,
+                max: RAW_SQL_MAX_SQL_BYTES_CAP,
+            }
+        })?;
+        let column_limit =
+            i32::try_from(options.max_columns).map_err(|_| StoreError::RawSqlLimitOutOfRange {
+                field: "max_columns",
+                value: options.max_columns,
+                min: 1,
+                max: RAW_SQL_MAX_COLUMNS_CAP,
+            })?;
+        let guard = Self {
+            conn,
+            length: conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, length_limit),
+            sql_length: conn.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, sql_length_limit),
+            column: conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, column_limit),
+        };
+        Ok(guard)
+    }
+}
+
+impl Drop for RawSqlLimitGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, self.length);
+        self.conn
+            .set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, self.sql_length);
+        self.conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, self.column);
+    }
+}
+
+fn raw_sql_length_limit(options: &RawSqlOptions) -> Result<i32> {
+    let bytes = options
+        .max_value_bytes
+        .saturating_add(RAW_SQL_VALUE_LENGTH_MARGIN_BYTES);
+    let bytes = bytes.max(RAW_SQL_MIN_SQLITE_LENGTH_LIMIT_BYTES);
+    i32::try_from(bytes).map_err(|_| StoreError::RawSqlLimitOutOfRange {
+        field: "max_value_bytes",
+        value: options.max_value_bytes,
+        min: 1,
+        max: RAW_SQL_MAX_VALUE_BYTES_CAP,
+    })
+}
+
+fn validate_raw_sql_usize(field: &'static str, value: usize, min: usize, max: usize) -> Result<()> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(StoreError::RawSqlLimitOutOfRange {
+            field,
+            value,
+            min,
+            max,
+        })
+    }
+}
+
+fn reject_sql_tail(conn: &Connection, sql: &str) -> Result<()> {
+    let c_sql = CString::new(sql).map_err(|_| StoreError::RawSqlInteriorNul)?;
+    let mut stmt = ptr::null_mut();
+    let mut tail: *const c_char = ptr::null();
+    let rc =
+        unsafe { ffi::sqlite3_prepare_v2(conn.handle(), c_sql.as_ptr(), -1, &mut stmt, &mut tail) };
+    if !stmt.is_null() {
+        unsafe {
+            ffi::sqlite3_finalize(stmt);
+        }
+    }
+    if rc != ffi::SQLITE_OK || tail.is_null() {
+        return Ok(());
+    }
+
+    let start = c_sql.as_ptr() as usize;
+    let tail_offset = (tail as usize).saturating_sub(start);
+    let sql_bytes = c_sql.as_bytes();
+    if tail_offset < sql_bytes.len() && sql_tail_has_statement(&sql[tail_offset..]) {
+        return Err(StoreError::Sql(rusqlite::Error::MultipleStatement));
+    }
+    Ok(())
+}
+
+fn sql_tail_has_statement(mut tail: &str) -> bool {
+    loop {
+        let trimmed = tail.trim_start();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            if let Some(newline) = rest.find('\n') {
+                tail = &rest[newline + 1..];
+                continue;
+            }
+            return false;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/*") {
+            if let Some(end) = rest.find("*/") {
+                tail = &rest[end + 2..];
+                continue;
+            }
+            return true;
+        }
+        return true;
+    }
+}
+
+fn raw_sql_value(value: ValueRef<'_>, max_value_bytes: usize) -> RawSqlValue {
+    match value {
+        ValueRef::Null => RawSqlValue::Null,
+        ValueRef::Integer(value) => RawSqlValue::Integer(value),
+        ValueRef::Real(value) => RawSqlValue::Real(value),
+        ValueRef::Text(bytes) => {
+            let truncated = bytes.len() > max_value_bytes;
+            let preview = if truncated {
+                String::from_utf8_lossy(&bytes[..max_value_bytes]).into_owned()
+            } else {
+                String::from_utf8_lossy(bytes).into_owned()
+            };
+            RawSqlValue::Text {
+                value: preview,
+                bytes: bytes.len(),
+                truncated,
+            }
+        }
+        ValueRef::Blob(bytes) => {
+            let truncated = bytes.len() > max_value_bytes;
+            let preview_len = bytes.len().min(max_value_bytes);
+            RawSqlValue::Blob {
+                bytes: bytes.len(),
+                preview_hex: hex_preview(&bytes[..preview_len]),
+                truncated,
+            }
+        }
+    }
+}
+
+fn hex_preview(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn migrate_legacy_history_layout(data_root: &Path) -> Result<bool> {
     let legacy_dir = data_root.join(LEGACY_HISTORY_DIR_NAME);
     if !legacy_dir.is_dir() {
@@ -4158,6 +4664,56 @@ fn migrate_to_v12(conn: &Connection) -> Result<()> {
     }
 }
 
+fn migrate_to_v13(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let migration = (|| -> Result<()> {
+        create_stable_sql_views(conn)?;
+        conn.execute_batch("PRAGMA user_version = 13;")?;
+        Ok(())
+    })();
+
+    match migration {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(err) => {
+            if let Err(rollback_err) = conn.execute_batch("ROLLBACK;") {
+                return Err(StoreError::Sql(rollback_err));
+            }
+            Err(err)
+        }
+    }
+}
+
+fn create_stable_sql_views(conn: &Connection) -> Result<()> {
+    conn.execute_batch(STABLE_SQL_VIEWS_SQL)?;
+    Ok(())
+}
+
+fn drop_stable_sql_views(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        DROP VIEW IF EXISTS ctx_sessions;
+        DROP VIEW IF EXISTS ctx_events;
+        DROP VIEW IF EXISTS ctx_files_touched;
+        DROP VIEW IF EXISTS ctx_sources;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn stable_sql_views_exist(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = 'ctx_sessions'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 fn invalidate_provider_import_indexes(conn: &Connection) -> Result<()> {
     if table_exists(conn, "catalog_sessions")? {
         conn.execute(
@@ -4267,6 +4823,10 @@ fn rebuild_capture_sources_provider_check(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
+    let recreate_views = stable_sql_views_exist(conn)?;
+    if recreate_views {
+        drop_stable_sql_views(conn)?;
+    }
     conn.execute_batch(
         r#"
         DROP TABLE IF EXISTS capture_sources_new;
@@ -4295,6 +4855,9 @@ fn rebuild_capture_sources_provider_check(conn: &Connection) -> Result<()> {
         ALTER TABLE capture_sources_new RENAME TO capture_sources;
         "#,
     )?;
+    if recreate_views {
+        create_stable_sql_views(conn)?;
+    }
     Ok(())
 }
 
@@ -4304,6 +4867,10 @@ fn rebuild_catalog_sessions_provider_check(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
+    let recreate_views = stable_sql_views_exist(conn)?;
+    if recreate_views {
+        drop_stable_sql_views(conn)?;
+    }
     conn.execute_batch(
         r#"
         DROP TABLE IF EXISTS catalog_sessions_new;
@@ -4339,6 +4906,9 @@ fn rebuild_catalog_sessions_provider_check(conn: &Connection) -> Result<()> {
         ALTER TABLE catalog_sessions_new RENAME TO catalog_sessions;
         "#,
     )?;
+    if recreate_views {
+        create_stable_sql_views(conn)?;
+    }
     Ok(())
 }
 
@@ -6968,6 +7538,139 @@ mod catalog_tests {
         assert!(schema.contains("indexed_status TEXT NOT NULL DEFAULT 'pending'"));
         assert!(schema.contains("indexed_error TEXT"));
         assert!(schema.contains("indexed_event_count INTEGER"));
+    }
+
+    #[test]
+    fn raw_sql_query_reads_stable_views() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let schema = store.schema().unwrap();
+        for view in [
+            "CREATE VIEW ctx_sessions",
+            "CREATE VIEW ctx_events",
+            "CREATE VIEW ctx_files_touched",
+            "CREATE VIEW ctx_sources",
+        ] {
+            assert!(schema.contains(view), "schema missing {view}");
+        }
+
+        let result = store
+            .raw_sql_query(
+                "SELECT COUNT(*) AS session_count FROM ctx_sessions",
+                RawSqlOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(result.columns[0].name, "session_count");
+        assert_eq!(result.returned_rows, 1);
+        assert_eq!(result.rows[0][0], RawSqlValue::Integer(0));
+    }
+
+    #[test]
+    fn raw_sql_query_rejects_writes_parameters_and_multiple_statements() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+
+        assert!(matches!(
+            store
+                .raw_sql_query("", RawSqlOptions::default())
+                .unwrap_err(),
+            StoreError::RawSqlEmpty
+        ));
+        assert!(matches!(
+            store
+                .raw_sql_query("SELECT ?1", RawSqlOptions::default())
+                .unwrap_err(),
+            StoreError::RawSqlHasParameters
+        ));
+        assert!(matches!(
+            store
+                .raw_sql_query("CREATE TABLE nope(x INTEGER)", RawSqlOptions::default())
+                .unwrap_err(),
+            StoreError::RawSqlNotReadOnly
+        ));
+        assert!(matches!(
+            store
+                .raw_sql_query("SELECT 1; SELECT 2", RawSqlOptions::default())
+                .unwrap_err(),
+            StoreError::Sql(rusqlite::Error::MultipleStatement)
+        ));
+    }
+
+    #[test]
+    fn raw_sql_query_caps_rows_and_values() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let result = store
+            .raw_sql_query(
+                "SELECT 'abcdef' AS text_value, X'01020304' AS blob_value UNION ALL SELECT 'ghijkl', X'05060708'",
+                RawSqlOptions {
+                    max_rows: 1,
+                    max_value_bytes: 3,
+                    ..RawSqlOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.returned_rows, 1);
+        assert_eq!(result.columns[0].name, "text_value");
+        assert_eq!(result.columns[1].name, "blob_value");
+        assert_eq!(
+            result.rows[0][0],
+            RawSqlValue::Text {
+                value: "abc".to_owned(),
+                bytes: 6,
+                truncated: true,
+            }
+        );
+        assert_eq!(
+            result.rows[0][1],
+            RawSqlValue::Blob {
+                bytes: 4,
+                preview_hex: "010203".to_owned(),
+                truncated: true,
+            }
+        );
+        assert!(result.truncated.rows);
+        assert!(result.truncated.values);
+    }
+
+    #[test]
+    fn raw_sql_query_times_out_long_running_queries() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let err = store
+            .raw_sql_query(
+                r#"
+                WITH RECURSIVE numbers(x) AS (
+                    SELECT 1
+                    UNION ALL
+                    SELECT x + 1 FROM numbers WHERE x < 100000000
+                )
+                SELECT sum(x) FROM numbers
+                "#,
+                RawSqlOptions {
+                    timeout: Duration::from_millis(1),
+                    ..RawSqlOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::RawSqlTimedOut { .. }));
+    }
+
+    #[test]
+    fn raw_sql_query_enforces_sqlite_value_length_limit() {
+        let temp = tempdir();
+        let store = Store::open(temp.path().join("work.sqlite")).unwrap();
+        let err = store
+            .raw_sql_query(
+                "SELECT length(randomblob(200000))",
+                RawSqlOptions::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::Sql(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == ErrorCode::TooBig
+        ));
     }
 
     #[test]

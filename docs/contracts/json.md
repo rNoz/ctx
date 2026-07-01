@@ -238,7 +238,7 @@ Each result can include:
 - `visibility`.
 
 `why_matched[]` can include text, metadata, or touched-file reasons. A touched
-file match is backed by normalized `files_touched` storage and can appear when
+file match is backed by normalized touched-file storage and can appear when
 search uses `--file <path>` or when file-path metadata contributes to ranking.
 `citations[]` can cite sessions, events, files, or source metadata depending on
 which indexed item produced the match.
@@ -264,10 +264,47 @@ When ctx can identify the active Codex provider session through
 that active session tree by default. Passing `--include-current-session` removes
 that filter.
 
+## SQL
+
+```bash
+ctx sql "SELECT COUNT(*) AS sessions FROM ctx_sessions" --json
+ctx sql --file query.sql --format json
+```
+
+Runs one read-only SQL statement against the existing local SQLite index and
+returns:
+
+- `schema_version`;
+- `item_type: "sql_result"`;
+- `read_only: true`;
+- `share_safe: false`;
+- `columns[]`, ordered selected column names;
+- `rows[]`, ordered arrays matching `columns[]`;
+- `returned_rows`;
+- `truncated.rows`;
+- `truncated.values`;
+- `limits.max_rows`;
+- `limits.max_columns`;
+- `limits.max_value_bytes`;
+- `limits.max_sql_bytes`;
+- `limits.timeout_ms`;
+- `elapsed_ms`.
+
+Scalar SQL values are encoded as JSON nulls, numbers, or strings when they fit
+the configured value cap. Truncated text values are encoded as objects with
+`type: "text"`, `value`, `bytes`, and `truncated: true`. Blob values are
+encoded as objects with `type: "blob"`, `bytes`, `preview_hex`, and
+`truncated`.
+
+Use stable `ctx_*` views for scripts when possible: `ctx_sessions`,
+`ctx_events`, `ctx_files_touched`, and `ctx_sources`. Internal tables remain
+queryable for advanced local inspection but are not the preferred compatibility
+surface.
+
 ## MCP Tool Results
 
 `ctx mcp serve` exposes read-only MCP tools over stdio for status, sources,
-search, showing sessions, and showing events. Tool results include
+search, SQL, showing sessions, and showing events. Tool results include
 `structuredContent` JSON using the same private local fields as CLI JSON. MCP
 output may include absolute paths, source metadata, snippets, and transcript
 text, and the MCP host may log or forward it.
@@ -275,6 +312,9 @@ text, and the MCP host may log or forward it.
 MCP search does not refresh or import provider history. It also excludes the
 active Codex session tree by default when `CODEX_THREAD_ID` is set; pass
 `include_current_session: true` to opt back in.
+
+The MCP `sql` tool uses the same `sql_result` JSON contract as `ctx sql
+--json`, always read-only.
 
 ## Docs
 

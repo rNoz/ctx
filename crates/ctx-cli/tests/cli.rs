@@ -464,7 +464,7 @@ fn help_exposes_session_retrieval_commands() {
         .unwrap_or(&help);
 
     for expected in [
-        "setup", "status", "sources", "import", "show", "search", "docs", "locate", "mcp",
+        "setup", "status", "sources", "import", "show", "search", "docs", "locate", "mcp", "sql",
         "upgrade", "doctor",
     ] {
         assert!(
@@ -1024,6 +1024,16 @@ fn public_subcommand_help_is_golden_enough_for_session_retrieval() {
         ),
         ("mcp", vec!["Usage: ctx mcp", "serve"]),
         (
+            "sql",
+            vec![
+                "Usage: ctx sql",
+                "--format <FORMAT>",
+                "--file <FILE>",
+                "--max-rows <MAX_ROWS>",
+                "Run read-only SQL against the local ctx index",
+            ],
+        ),
+        (
             "upgrade",
             vec![
                 "Usage: ctx upgrade",
@@ -1090,6 +1100,78 @@ fn public_subcommand_help_is_golden_enough_for_session_retrieval() {
             );
         }
     }
+}
+
+#[test]
+fn sql_reads_existing_store_and_supports_formats_and_input_sources() {
+    let temp = tempdir();
+    ctx(&temp)
+        .args(["setup", "--catalog-only", "--progress", "none"])
+        .assert()
+        .success();
+
+    let json = json_output(ctx(&temp).args(["sql", "SELECT 1 AS one, 'two' AS two", "--json"]));
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["item_type"], "sql_result");
+    assert_eq!(json["read_only"], true);
+    assert_eq!(json["share_safe"], false);
+    assert_eq!(json["columns"], json!(["one", "two"]));
+    assert_eq!(json["rows"], json!([[1, "two"]]));
+    assert_eq!(json["returned_rows"], 1);
+
+    let query_file = temp.path().join("query.sql");
+    fs::write(&query_file, "SELECT 'a,b' AS value, 2 AS n").unwrap();
+    let csv_output = ctx(&temp)
+        .arg("sql")
+        .arg("--file")
+        .arg(&query_file)
+        .args(["--format", "csv"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(csv_output).unwrap(),
+        "value,n\n\"a,b\",2\n"
+    );
+
+    let raw_output = ctx(&temp)
+        .args(["sql", "-", "--format", "raw"])
+        .write_stdin("SELECT 'abc' AS value")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(String::from_utf8(raw_output).unwrap(), "abc\n");
+}
+
+#[test]
+fn sql_is_read_only_and_does_not_initialize_store() {
+    let temp = tempdir();
+    let stderr = failure_stderr(ctx(&temp).args(["sql", "SELECT 1"]));
+    assert!(stderr.contains("ctx store is not initialized"));
+    assert!(!temp.path().join("work.sqlite").exists());
+
+    ctx(&temp)
+        .args(["setup", "--catalog-only", "--progress", "none"])
+        .assert()
+        .success();
+
+    let stderr = failure_stderr(ctx(&temp).args(["sql", "CREATE TABLE nope(x INTEGER)"]));
+    assert!(stderr.contains("SQL query must be read-only"));
+    let conn = Connection::open(temp.path().join("work.sqlite")).unwrap();
+    assert_eq!(
+        sqlite_count(
+            &conn,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'nope'"
+        ),
+        0
+    );
+
+    let stderr = failure_stderr(ctx(&temp).args(["sql", "SELECT 1; SELECT 2"]));
+    assert!(stderr.contains("Multiple statements provided"));
 }
 
 #[test]
@@ -1960,7 +2042,14 @@ fn mcp_status_and_tools_list_are_read_only_without_initialized_store() {
     );
 
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
-    for expected in ["status", "sources", "search", "show_session", "show_event"] {
+    for expected in [
+        "status",
+        "sources",
+        "search",
+        "sql",
+        "show_session",
+        "show_event",
+    ] {
         assert!(
             tools.iter().any(|tool| tool["name"] == expected),
             "missing MCP tool {expected} in {tools:#?}"
@@ -1985,6 +2074,68 @@ fn mcp_status_and_tools_list_are_read_only_without_initialized_store() {
         !temp.path().join("work.sqlite").exists(),
         "MCP status should not initialize the ctx store"
     );
+}
+
+#[test]
+fn mcp_sql_tool_returns_structured_json_and_rejects_writes() {
+    let temp = tempdir();
+    ctx(&temp)
+        .args(["setup", "--catalog-only", "--progress", "none"])
+        .assert()
+        .success();
+
+    let responses = mcp_roundtrip(
+        &temp,
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": "init",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "ctx-test", "version": "0" }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "sql",
+                "method": "tools/call",
+                "params": {
+                    "name": "sql",
+                    "arguments": {
+                        "sql": "SELECT COUNT(*) AS sessions FROM ctx_sessions",
+                        "max_rows": 5
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "write",
+                "method": "tools/call",
+                "params": {
+                    "name": "sql",
+                    "arguments": {
+                        "sql": "CREATE TABLE nope(x INTEGER)"
+                    }
+                }
+            }),
+        ],
+    );
+
+    let sql = &responses[1]["result"]["structuredContent"];
+    assert_eq!(sql["item_type"], "sql_result");
+    assert_eq!(sql["read_only"], true);
+    assert_eq!(sql["share_safe"], false);
+    assert_eq!(sql["columns"], json!(["sessions"]));
+    assert_eq!(sql["rows"], json!([[0]]));
+
+    let write = &responses[2]["result"];
+    assert_eq!(write["isError"], true);
+    assert!(write["structuredContent"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("SQL query must be read-only"));
 }
 
 #[test]

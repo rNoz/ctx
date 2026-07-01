@@ -50,6 +50,9 @@ ctx search --file crates/foo/src/lib.rs
 # Or search multiple terms
 ctx search --term "failed migration" --term rollback --term "cursor rename"
 
+# Advanced: inspect exact local index data with read-only SQL
+ctx sql "SELECT provider, COUNT(*) AS sessions FROM ctx_sessions GROUP BY provider"
+
 # Results include matching sessions, snippets, and ctx IDs
 # evt_01h...  ses_01h...  codex  "migration expected the old cursor name" ...
 
@@ -116,4 +119,4 @@ ctx keeps retrieval tied to sessions and events, so another agent can inspect th
 | [Cursor](https://ctx.rs/agents/cursor) | Import Cursor agent transcripts and ask Cursor to cite retrieved local history before editing. |
 | [How it works](https://ctx.rs/concepts/how-it-works) | Understand discovery, import, SQLite storage, search refresh, and cited retrieval. |
 | [Supported agents](https://ctx.rs/concepts/supported-agents) | See which agent histories ctx can discover, import, and search today. |
-| [CLI reference](https://ctx.rs/reference/cli) | Review setup, status, sources, import, show, locate, search, MCP, and doctor. |
+| [CLI reference](https://ctx.rs/reference/cli) | Review setup, status, sources, import, show, locate, search, SQL, MCP, and doctor. |

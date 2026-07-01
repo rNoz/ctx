@@ -211,6 +211,49 @@ Filters:
 SQLite, and may write newly discovered native provider history into the local
 index before querying.
 
+## SQL
+
+```bash
+ctx sql "SELECT COUNT(*) AS sessions FROM ctx_sessions"
+ctx sql "SELECT provider, COUNT(*) AS sessions FROM ctx_sessions GROUP BY provider"
+ctx sql --file query.sql --format json
+cat query.sql | ctx sql - --format csv
+ctx sql "SELECT ctx_session_id FROM ctx_sessions LIMIT 5" --format raw
+```
+
+`sql` runs one read-only SQL statement against the existing local ctx SQLite
+index. It does not create or migrate the store, refresh provider history, import
+sources, run background upgrade checks, or write provider files or source
+repositories. If the store is missing or uses an old schema, run `ctx setup`,
+`ctx import`, or `ctx status` first.
+
+Prefer stable read-only `ctx_*` views for scripts:
+
+- `ctx_sessions`, one row per indexed session;
+- `ctx_events`, one row per indexed event;
+- `ctx_files_touched`, one row per normalized touched-file record;
+- `ctx_sources`, one row per cataloged provider source session.
+
+Advanced users can query internal tables directly, but internal table details
+are not the compatibility surface. SQL output is private local history and can
+include transcript payloads, paths, and source metadata.
+
+Formats:
+
+- default `table` output is compact and intended for humans and agents;
+- `--format json` or `--json` returns a structured result with `columns`,
+  array rows, limits, truncation flags, `read_only: true`, and
+  `share_safe: false`;
+- `--format csv` prints a CSV header unless `--no-header` is set;
+- `--format raw` requires exactly one selected column and prints one value per
+  line for piping.
+
+Limits default to `--max-rows 100`, `--max-columns 64`,
+`--max-value-bytes 512`, `--max-sql-bytes 65536`, and `--timeout 10s`.
+SQLite-side value allocation is also bounded, so very large generated values
+can fail before result truncation. `--timeout` accepts values such as `250ms`,
+`5s`, or `1m`, capped at one minute.
+
 ## Docs
 
 ```bash
@@ -229,8 +272,9 @@ ctx docs man --out ~/.local/share/man/man1
 `docs` exposes a curated copy of the public ctx docs inside the binary. It is
 intended for humans and agents that need local command help without opening the
 website. `docs list`, `docs search`, and `docs show` read embedded text and do
-not touch provider history or the local SQLite index. `docs man --print PAGE`
-prints one generated man page to stdout; `docs man --out DIR` writes generated
+not touch provider history or the local SQLite index. `docs show --out PATH`
+writes one embedded topic to that explicit path. `docs man --print PAGE` prints
+one generated man page to stdout; `docs man --out DIR` writes generated
 section-1 man pages for `ctx` and its public subcommands.
 
 Agents should usually use `ctx docs search` or `ctx docs show` rather than
@@ -244,12 +288,13 @@ ctx mcp serve
 ```
 
 `mcp serve` starts a read-only MCP server over newline-delimited stdio JSON-RPC.
-It exposes tools for `status`, `sources`, `search`, `show_session`, and
-`show_event`. The MCP search tool searches the existing index only; it does not
-refresh or import provider history. Tool results include MCP text content plus
-`structuredContent` JSON. Treat all MCP output as private local history: it may
-include absolute paths, source metadata, snippets, and transcript text, and the
-MCP host may log or forward tool output.
+It exposes tools for `status`, `sources`, `search`, `sql`, `show_session`, and
+`show_event`. The MCP search and SQL tools query the existing index only; they
+do not refresh or import provider history. Tool results include MCP text
+content plus `structuredContent` JSON. Treat all MCP output as private local
+history: it may include absolute paths, source metadata, snippets, transcript
+text, and raw SQL result fields, and the MCP host may log or forward tool
+output.
 
 MCP search follows the same active Codex session-tree exclusion as the CLI when
 `CODEX_THREAD_ID` is set. Pass `include_current_session: true` to the search
@@ -323,6 +368,7 @@ ctx show event <ctx-event-id> --format json
 ctx locate session <ctx-session-id> --format json
 ctx locate event <ctx-event-id> --format json
 ctx search [query] --json
+ctx sql "SELECT COUNT(*) FROM ctx_sessions" --json
 ctx docs list --json
 ctx docs search <query> --json
 ctx docs show <topic> --format json

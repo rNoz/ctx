@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{IsTerminal, Write},
+    io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
@@ -11,7 +11,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde_json::{json, Value};
+use serde_json::{json, Number, Value};
 use uuid::Uuid;
 
 mod analytics;
@@ -43,7 +43,10 @@ use ctx_history_core::{
     EventRole, EventType, HistoryRecord, ProviderRawRetention, RedactionState, Session,
 };
 use ctx_history_store::{
-    CatalogSession, CatalogSourceIndexUpdate, SourceImportFile, SourceImportFileIndexUpdate, Store,
+    CatalogSession, CatalogSourceIndexUpdate, RawSqlOptions, RawSqlResult, RawSqlValue,
+    SourceImportFile, SourceImportFileIndexUpdate, Store, StoreError, RAW_SQL_DEFAULT_MAX_COLUMNS,
+    RAW_SQL_DEFAULT_MAX_ROWS, RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES,
+    RAW_SQL_MAX_TIMEOUT,
 };
 
 const WAL_TRUNCATE_MIN_BYTES: u64 = 64 * 1024 * 1024;
@@ -76,6 +79,8 @@ enum CommandRoot {
     Locate(LocateArgs),
     #[command(about = "Search indexed agent history")]
     Search(SearchArgs),
+    #[command(about = "Run read-only SQL against the local ctx index")]
+    Sql(SqlArgs),
     #[command(about = "Read embedded ctx documentation")]
     Docs(docs::DocsArgs),
     #[command(about = "Serve read-only ctx tools over MCP")]
@@ -265,6 +270,44 @@ struct SearchArgs {
     verbose: bool,
 }
 
+#[derive(Debug, Args)]
+struct SqlArgs {
+    #[arg(help = "Read-only SQL statement to run; pass '-' to read SQL from stdin")]
+    sql: Option<String>,
+    #[arg(long, conflicts_with = "sql", help = "Read SQL from a file")]
+    file: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = SqlFormat::Table)]
+    format: SqlFormat,
+    #[arg(long, help = "Alias for --format json")]
+    json: bool,
+    #[arg(long, default_value_t = RAW_SQL_DEFAULT_MAX_ROWS)]
+    max_rows: usize,
+    #[arg(long, default_value_t = RAW_SQL_DEFAULT_MAX_COLUMNS)]
+    max_columns: usize,
+    #[arg(long, default_value_t = RAW_SQL_DEFAULT_MAX_VALUE_BYTES)]
+    max_value_bytes: usize,
+    #[arg(long, default_value_t = RAW_SQL_DEFAULT_MAX_SQL_BYTES)]
+    max_sql_bytes: usize,
+    #[arg(long, default_value = "10s", value_parser = parse_sql_timeout)]
+    timeout: StdDuration,
+    #[arg(long, help = "Omit the header row for CSV output")]
+    no_header: bool,
+}
+
+impl SqlArgs {
+    fn output_format(&self) -> SqlFormat {
+        if self.json {
+            SqlFormat::Json
+        } else {
+            self.format
+        }
+    }
+
+    fn json_output(&self) -> bool {
+        self.output_format() == SqlFormat::Json
+    }
+}
+
 pub(crate) struct SearchFilterInput {
     session: Option<Uuid>,
     provider: Option<ProviderArg>,
@@ -287,6 +330,7 @@ impl CommandRoot {
             Self::Show(_) => "show",
             Self::Locate(_) => "locate",
             Self::Search(_) => "search",
+            Self::Sql(_) => "sql",
             Self::Docs(_) => "docs",
             Self::Mcp(_) => "mcp",
             Self::Upgrade(_) => "upgrade",
@@ -296,7 +340,7 @@ impl CommandRoot {
 
     fn sends_analytics(&self) -> bool {
         match self {
-            Self::Mcp(_) => false,
+            Self::Sql(_) | Self::Mcp(_) => false,
             Self::Upgrade(args) if args.background() => false,
             _ => true,
         }
@@ -311,6 +355,7 @@ impl CommandRoot {
             Self::Show(args) => args.json_output(),
             Self::Locate(args) => args.json_output(),
             Self::Search(args) => args.json,
+            Self::Sql(args) => args.json_output(),
             Self::Docs(args) => args.json_output(),
             Self::Mcp(_) => false,
             Self::Upgrade(args) => args.json_output(),
@@ -319,7 +364,10 @@ impl CommandRoot {
     }
 
     fn allows_background_upgrade(&self) -> bool {
-        !matches!(self, Self::Docs(_) | Self::Mcp(_) | Self::Upgrade(_))
+        !matches!(
+            self,
+            Self::Docs(_) | Self::Mcp(_) | Self::Sql(_) | Self::Upgrade(_)
+        )
     }
 }
 
@@ -387,6 +435,14 @@ enum OutputFormat {
 enum LocateFormat {
     Text,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SqlFormat {
+    Table,
+    Json,
+    Csv,
+    Raw,
 }
 
 impl LocateFormat {
@@ -1072,6 +1128,7 @@ fn main() -> Result<()> {
         CommandRoot::Show(args) => run_show(args, data_root.clone(), &mut analytics_properties),
         CommandRoot::Locate(args) => run_locate(args, data_root.clone(), &mut analytics_properties),
         CommandRoot::Search(args) => run_search(args, data_root.clone(), &mut analytics_properties),
+        CommandRoot::Sql(args) => run_sql(args, data_root.clone()),
         CommandRoot::Docs(args) => docs::run(args),
         CommandRoot::Mcp(args) => mcp::run(args, data_root.clone()),
         CommandRoot::Upgrade(args) => upgrade::run(args, data_root.clone(), config.clone()),
@@ -1107,7 +1164,10 @@ fn command_analytics_properties(command: &CommandRoot) -> AnalyticsProperties {
                 progress_mode_name(args.progress),
             );
         }
-        CommandRoot::Status(_) | CommandRoot::Sources(_) | CommandRoot::Doctor(_) => {}
+        CommandRoot::Status(_)
+        | CommandRoot::Sources(_)
+        | CommandRoot::Sql(_)
+        | CommandRoot::Doctor(_) => {}
         CommandRoot::Import(args) => {
             analytics::insert_bool(&mut properties, "resume", args.resume);
             analytics::insert_bool(&mut properties, "all_sources", args.all);
@@ -3185,6 +3245,37 @@ fn parse_search_limit(value: &str) -> std::result::Result<usize, String> {
     Ok(limit)
 }
 
+fn parse_sql_timeout(value: &str) -> std::result::Result<StdDuration, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("timeout must not be empty".to_owned());
+    }
+    let (number, multiplier_ms) = if let Some(number) = trimmed.strip_suffix("ms") {
+        (number, 1.0)
+    } else if let Some(number) = trimmed.strip_suffix('s') {
+        (number, 1_000.0)
+    } else if let Some(number) = trimmed.strip_suffix('m') {
+        (number, 60_000.0)
+    } else {
+        (trimmed, 1_000.0)
+    };
+    let amount = number
+        .parse::<f64>()
+        .map_err(|err| format!("invalid timeout: {err}"))?;
+    if !amount.is_finite() || amount <= 0.0 {
+        return Err("timeout must be greater than zero".to_owned());
+    }
+    let millis = (amount * multiplier_ms).round();
+    let max_millis = RAW_SQL_MAX_TIMEOUT.as_millis() as f64;
+    if millis < 1.0 || millis > max_millis {
+        return Err(format!(
+            "timeout must be between 1ms and {}ms",
+            RAW_SQL_MAX_TIMEOUT.as_millis()
+        ));
+    }
+    Ok(StdDuration::from_millis(millis as u64))
+}
+
 fn prune_null_json(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -3199,6 +3290,296 @@ fn prune_null_json(value: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+fn run_sql(args: SqlArgs, data_root: PathBuf) -> Result<()> {
+    let sql = read_sql_input(&args)?;
+    let db_path = database_path(data_root);
+    if !db_path.exists() {
+        return Err(anyhow!(
+            "ctx store is not initialized at {}; run `ctx setup` or `ctx import` first",
+            db_path.display()
+        ));
+    }
+    let store = match Store::open_read_only(&db_path) {
+        Ok(store) => store,
+        Err(StoreError::UnsupportedSchemaVersion(version)) => {
+            return Err(anyhow!(
+                "ctx store schema version {version} is not supported by this ctx binary; run `ctx status` once to migrate before using `ctx sql`"
+            ));
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("open read-only ctx store {}", db_path.display()));
+        }
+    };
+    let result = store.raw_sql_query(
+        &sql,
+        RawSqlOptions {
+            max_rows: args.max_rows,
+            max_columns: args.max_columns,
+            max_value_bytes: args.max_value_bytes,
+            max_sql_bytes: args.max_sql_bytes,
+            timeout: args.timeout,
+        },
+    )?;
+
+    match args.output_format() {
+        SqlFormat::Table => print_sql_table(&result),
+        SqlFormat::Json => print_share_safe_value(raw_sql_result_json(&result)),
+        SqlFormat::Csv => print_sql_csv(&result, args.no_header),
+        SqlFormat::Raw => print_sql_raw(&result),
+    }
+}
+
+fn read_sql_input(args: &SqlArgs) -> Result<String> {
+    match (&args.sql, &args.file) {
+        (Some(sql), None) if sql == "-" => {
+            let mut input = String::new();
+            std::io::stdin()
+                .read_to_string(&mut input)
+                .context("read SQL from stdin")?;
+            Ok(input)
+        }
+        (Some(sql), None) => Ok(sql.clone()),
+        (None, Some(path)) => {
+            fs::read_to_string(path).with_context(|| format!("read SQL from {}", path.display()))
+        }
+        (None, None) => Err(anyhow!(
+            "SQL is required; pass a statement, --file <path>, or '-' for stdin"
+        )),
+        (Some(_), Some(_)) => unreachable!("clap rejects --file with inline SQL"),
+    }
+}
+
+fn print_sql_table(result: &RawSqlResult) -> Result<()> {
+    let rows = result
+        .rows
+        .iter()
+        .map(|row| row.iter().map(sql_table_cell).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let mut widths = result
+        .columns
+        .iter()
+        .map(|column| column.name.chars().count())
+        .collect::<Vec<_>>();
+    for row in &rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+
+    let headers = result
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| pad_table_cell(&column.name, widths[index]))
+        .collect::<Vec<_>>();
+    println!("{}", headers.join(" | "));
+    let separators = widths
+        .iter()
+        .map(|width| "-".repeat(*width))
+        .collect::<Vec<_>>();
+    println!("{}", separators.join(" | "));
+    for row in &rows {
+        let cells = row
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| pad_table_cell(cell, widths[index]))
+            .collect::<Vec<_>>();
+        println!("{}", cells.join(" | "));
+    }
+    if result.rows.is_empty() {
+        println!("(0 rows)");
+    }
+    print_sql_truncation_notice(result);
+    Ok(())
+}
+
+fn print_sql_csv(result: &RawSqlResult, no_header: bool) -> Result<()> {
+    if !no_header {
+        println!(
+            "{}",
+            result
+                .columns
+                .iter()
+                .map(|column| csv_escape(&column.name))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    for row in &result.rows {
+        println!(
+            "{}",
+            row.iter()
+                .map(sql_csv_cell)
+                .map(|cell| csv_escape(&cell))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    print_sql_truncation_notice(result);
+    Ok(())
+}
+
+fn print_sql_raw(result: &RawSqlResult) -> Result<()> {
+    if result.columns.len() != 1 {
+        return Err(anyhow!(
+            "--format raw requires exactly one selected column; got {}",
+            result.columns.len()
+        ));
+    }
+    for row in &result.rows {
+        println!("{}", sql_raw_cell(&row[0]));
+    }
+    print_sql_truncation_notice(result);
+    Ok(())
+}
+
+fn print_sql_truncation_notice(result: &RawSqlResult) {
+    if result.truncated.rows {
+        eprintln!(
+            "warning: rows truncated at {}; rerun with --max-rows for more",
+            result.limits.max_rows
+        );
+    }
+    if result.truncated.values {
+        eprintln!(
+            "warning: values truncated at {} bytes; rerun with --max-value-bytes for more",
+            result.limits.max_value_bytes
+        );
+    }
+}
+
+pub(crate) fn raw_sql_result_json(result: &RawSqlResult) -> Value {
+    compact_json(json!({
+        "schema_version": 1,
+        "item_type": "sql_result",
+        "read_only": true,
+        "columns": result.columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>(),
+        "rows": result
+            .rows
+            .iter()
+            .map(|row| row.iter().map(raw_sql_value_json).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        "returned_rows": result.returned_rows,
+        "truncated": {
+            "rows": result.truncated.rows,
+            "values": result.truncated.values,
+        },
+        "limits": {
+            "max_rows": result.limits.max_rows,
+            "max_columns": result.limits.max_columns,
+            "max_value_bytes": result.limits.max_value_bytes,
+            "max_sql_bytes": result.limits.max_sql_bytes,
+            "timeout_ms": result.limits.timeout_ms,
+        },
+        "elapsed_ms": result.elapsed.as_millis(),
+    }))
+}
+
+fn raw_sql_value_json(value: &RawSqlValue) -> Value {
+    match value {
+        RawSqlValue::Null => Value::Null,
+        RawSqlValue::Integer(value) => json!(value),
+        RawSqlValue::Real(value) => Number::from_f64(*value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        RawSqlValue::Text {
+            value,
+            bytes,
+            truncated,
+        } if *truncated => json!({
+            "type": "text",
+            "value": value,
+            "bytes": bytes,
+            "truncated": true,
+        }),
+        RawSqlValue::Text { value, .. } => Value::String(value.clone()),
+        RawSqlValue::Blob {
+            bytes,
+            preview_hex,
+            truncated,
+        } => json!({
+            "type": "blob",
+            "bytes": bytes,
+            "preview_hex": preview_hex,
+            "truncated": truncated,
+        }),
+    }
+}
+
+fn sql_table_cell(value: &RawSqlValue) -> String {
+    truncate_table_cell(&sql_display_cell(value), 96)
+}
+
+fn sql_csv_cell(value: &RawSqlValue) -> String {
+    sql_display_cell(value)
+}
+
+fn sql_raw_cell(value: &RawSqlValue) -> String {
+    match value {
+        RawSqlValue::Null => String::new(),
+        RawSqlValue::Integer(value) => value.to_string(),
+        RawSqlValue::Real(value) => value.to_string(),
+        RawSqlValue::Text { value, .. } => value.clone(),
+        RawSqlValue::Blob { preview_hex, .. } => preview_hex.clone(),
+    }
+}
+
+fn sql_display_cell(value: &RawSqlValue) -> String {
+    match value {
+        RawSqlValue::Null => "NULL".to_owned(),
+        RawSqlValue::Integer(value) => value.to_string(),
+        RawSqlValue::Real(value) => value.to_string(),
+        RawSqlValue::Text {
+            value, truncated, ..
+        } => {
+            let mut value = value.replace('\n', "\\n").replace('\r', "\\r");
+            if *truncated {
+                value.push_str("...");
+            }
+            value
+        }
+        RawSqlValue::Blob {
+            bytes,
+            preview_hex,
+            truncated,
+        } => {
+            if *truncated {
+                format!("[blob {bytes} bytes {preview_hex}...]")
+            } else {
+                format!("[blob {bytes} bytes {preview_hex}]")
+            }
+        }
+    }
+}
+
+fn truncate_table_cell(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut truncated = value.chars().take(keep).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn pad_table_cell(value: &str, width: usize) -> String {
+    let len = value.chars().count();
+    if len >= width {
+        value.to_owned()
+    } else {
+        format!("{value}{}", " ".repeat(width - len))
+    }
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
     }
 }
 

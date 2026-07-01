@@ -1,20 +1,26 @@
 use std::{
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use ctx_history_core::{database_path, EventType};
-use ctx_history_store::Store;
+use ctx_history_store::{
+    RawSqlOptions, Store, RAW_SQL_DEFAULT_MAX_COLUMNS, RAW_SQL_DEFAULT_MAX_ROWS,
+    RAW_SQL_DEFAULT_MAX_SQL_BYTES, RAW_SQL_DEFAULT_MAX_VALUE_BYTES, RAW_SQL_DEFAULT_TIMEOUT,
+    RAW_SQL_MAX_COLUMNS_CAP, RAW_SQL_MAX_ROWS_CAP, RAW_SQL_MAX_SQL_BYTES_CAP, RAW_SQL_MAX_TIMEOUT,
+    RAW_SQL_MAX_VALUE_BYTES_CAP,
+};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::{
     compact_json, config::CONFIG_FILE, discovered_sources, event_window, event_window_json,
-    indexed_history_item_count, mark_share_safe, search_filters, session_transcript_json,
-    sources_json, OutputFormat, ProviderArg, RefreshArg, SearchDto, SearchFilterInput,
-    SearchRefreshReport, TranscriptMode, MAX_SEARCH_LIMIT,
+    indexed_history_item_count, mark_share_safe, raw_sql_result_json, search_filters,
+    session_transcript_json, sources_json, OutputFormat, ProviderArg, RefreshArg, SearchDto,
+    SearchFilterInput, SearchRefreshReport, TranscriptMode, MAX_SEARCH_LIMIT,
 };
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -161,7 +167,7 @@ fn initialize_result() -> Value {
             "name": "ctx",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Read-only access to the local ctx index. Tool output is private local history and may include absolute paths, source metadata, snippets, and transcript text; MCP hosts may log or forward it. This minimal server supports initialize, ping, tools/list, and tools/call over newline-delimited stdio. It does not expose MCP resources or prompts, and tools do not import provider history, write provider files, or write repositories."
+        "instructions": "Read-only access to the local ctx index. Tool output is private local history and may include absolute paths, source metadata, snippets, transcript text, and raw SQL query results; MCP hosts may log or forward it. This minimal server supports initialize, ping, tools/list, and tools/call over newline-delimited stdio. It does not expose MCP resources or prompts, and tools do not import provider history, write provider files, or write repositories."
     })
 }
 
@@ -213,6 +219,20 @@ fn handle_tools_call(params: Value, data_root: &Path) -> Result<Value, Value> {
                 ],
             )?;
             tool_search(&arguments, data_root)
+        }
+        "sql" => {
+            validate_argument_keys(
+                &arguments,
+                &[
+                    "sql",
+                    "max_rows",
+                    "max_columns",
+                    "max_value_bytes",
+                    "max_sql_bytes",
+                    "timeout_ms",
+                ],
+            )?;
+            tool_sql(&arguments, data_root)
         }
         "show_session" => {
             validate_argument_keys(&arguments, &["ctx_session_id", "mode"])?;
@@ -341,6 +361,35 @@ fn tool_search(arguments: &Value, data_root: &Path) -> Result<Value> {
     Ok(value)
 }
 
+fn tool_sql(arguments: &Value, data_root: &Path) -> Result<Value> {
+    let store = open_existing_store(data_root)?;
+    let sql = optional_string(arguments, "sql")?.ok_or_else(|| anyhow!("sql is required"))?;
+    let max_rows = optional_usize(arguments, "max_rows")?.unwrap_or(RAW_SQL_DEFAULT_MAX_ROWS);
+    let max_columns =
+        optional_usize(arguments, "max_columns")?.unwrap_or(RAW_SQL_DEFAULT_MAX_COLUMNS);
+    let max_value_bytes =
+        optional_usize(arguments, "max_value_bytes")?.unwrap_or(RAW_SQL_DEFAULT_MAX_VALUE_BYTES);
+    let max_sql_bytes =
+        optional_usize(arguments, "max_sql_bytes")?.unwrap_or(RAW_SQL_DEFAULT_MAX_SQL_BYTES);
+    let timeout_ms = optional_usize(arguments, "timeout_ms")?
+        .map(|value| u64::try_from(value).map_err(|_| anyhow!("timeout_ms is too large")))
+        .transpose()?
+        .unwrap_or_else(|| duration_millis_u64(RAW_SQL_DEFAULT_TIMEOUT));
+    let result = store.raw_sql_query(
+        &sql,
+        RawSqlOptions {
+            max_rows,
+            max_columns,
+            max_value_bytes,
+            max_sql_bytes,
+            timeout: Duration::from_millis(timeout_ms),
+        },
+    )?;
+    let mut value = raw_sql_result_json(&result);
+    mark_share_safe(&mut value);
+    Ok(value)
+}
+
 fn tool_show_session(arguments: &Value, data_root: &Path) -> Result<Value> {
     let store = open_existing_store(data_root)?;
     let session_id = required_uuid(arguments, "ctx_session_id")?;
@@ -457,6 +506,25 @@ fn tool_definitions() -> Vec<Value> {
             "annotations": { "readOnlyHint": true },
         }),
         json!({
+            "name": "sql",
+            "title": "SQL",
+            "description": "Run one read-only SQL statement against the existing local ctx index. Prefer stable ctx_* views for scripts.",
+            "inputSchema": object_schema(json!({
+                "sql": { "type": "string", "description": "Single read-only SQL statement." },
+                "max_rows": { "type": "integer", "minimum": 1, "maximum": RAW_SQL_MAX_ROWS_CAP, "default": RAW_SQL_DEFAULT_MAX_ROWS },
+                "max_columns": { "type": "integer", "minimum": 1, "maximum": RAW_SQL_MAX_COLUMNS_CAP, "default": RAW_SQL_DEFAULT_MAX_COLUMNS },
+                "max_value_bytes": { "type": "integer", "minimum": 1, "maximum": RAW_SQL_MAX_VALUE_BYTES_CAP, "default": RAW_SQL_DEFAULT_MAX_VALUE_BYTES },
+                "max_sql_bytes": { "type": "integer", "minimum": 1, "maximum": RAW_SQL_MAX_SQL_BYTES_CAP, "default": RAW_SQL_DEFAULT_MAX_SQL_BYTES },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": duration_millis_u64(RAW_SQL_MAX_TIMEOUT),
+                    "default": duration_millis_u64(RAW_SQL_DEFAULT_TIMEOUT)
+                }
+            }), vec!["sql"]),
+            "annotations": { "readOnlyHint": true },
+        }),
+        json!({
             "name": "show_session",
             "title": "Show Session",
             "description": "Return an indexed session transcript by ctx session id.",
@@ -530,6 +598,10 @@ fn optional_string(arguments: &Value, key: &str) -> Result<Option<String>> {
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(_) => Err(anyhow!("{key} must be a string")),
     }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn optional_bool(arguments: &Value, key: &str) -> Result<Option<bool>> {

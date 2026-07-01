@@ -81,7 +81,8 @@ analytics marker described under network behavior.
 | `ctx show` | SQLite index | selected `--out` path for `show session` when provided |
 | `ctx locate` | SQLite index and raw source path metadata | none |
 | `ctx search` | native provider transcript files, path metadata, and SQLite index | SQLite index for newly discovered native provider history |
-| `ctx docs` | embedded documentation in the binary | selected `--out` directory for `ctx docs man --out` |
+| `ctx sql` | existing SQLite index only | none |
+| `ctx docs` | embedded documentation in the binary | selected topic `--out` path for `ctx docs show --out` or selected `--out` directory for `ctx docs man --out` |
 | `ctx upgrade` | signed release metadata and installed binary/sidecar metadata | installed binary for manual upgrade, install sidecar, `upgrade-state.json`, `upgrade.lock`, and `logs/upgrade.log` |
 | `ctx doctor` | SQLite index and data root metadata | none |
 
@@ -155,6 +156,26 @@ provider locations are discovered each time and explicit `--path` imports are
 not remembered as future defaults. To remove already indexed data, rebuild the
 index and import only the sources you still want.
 
+## SQL Inspection
+
+`ctx sql` is a read-only advanced inspection command for cases normal search
+does not express, such as exact counts, joins, audits, and one-off scripts. It
+opens the existing SQLite store in read-only mode, rejects writes, rejects
+multiple statements, enforces row/column/value caps, and times out long-running
+queries. It also applies SQLite runtime limits to bound SQL text and generated
+value allocation. It does not initialize or migrate the store; run `ctx
+status`, `ctx setup`, or `ctx import` first when a schema migration is required.
+
+Stable read-only views are the preferred compatibility surface:
+
+- `ctx_sessions`;
+- `ctx_events`;
+- `ctx_files_touched`;
+- `ctx_sources`.
+
+Internal tables remain local and queryable, but they are implementation details
+and can change across versions. SQL output is private local history by default.
+
 Reset and rebuild the index:
 
 ```bash
@@ -207,10 +228,10 @@ behavior.
 Official installer-managed binaries can contact the signed release metadata
 endpoint for `ctx upgrade` and for background auto-upgrade checks after
 successful normal commands. These checks are skipped for JSON commands, MCP,
-`ctx docs`, `ctx upgrade`, CI, unmanaged installs, and process-level opt-outs
-such as `CTX_UPGRADE_OFF=1` or `CTX_DISABLE_AUTO_UPGRADE=1`. Upgrade metadata
-checks do not send provider transcript text, search queries, result snippets,
-source paths, repository names, or command output.
+`ctx docs`, `ctx sql`, `ctx upgrade`, CI, unmanaged installs, and process-level
+opt-outs such as `CTX_UPGRADE_OFF=1` or `CTX_DISABLE_AUTO_UPGRADE=1`. Upgrade
+metadata checks do not send provider transcript text, search queries, result
+snippets, source paths, repository names, or command output.
 
 First-party analytics are default-on and may create `install.json` and send
 coarse product metadata. They do not send session text, prompts, transcripts,
@@ -228,6 +249,8 @@ Analytics may include:
 - provider identifiers such as `codex` or `claude` when selected as filters;
 - coarse Cloudflare-derived geography such as country, region, colo, ASN, and
   AS organization.
+
+`ctx sql` and MCP do not send first-party analytics events.
 
 To disable analytics, add:
 

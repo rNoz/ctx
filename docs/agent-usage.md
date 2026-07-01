@@ -22,6 +22,10 @@ provider history into the local ctx index before querying. Use
 `ctx search ... --refresh off` when the task requires a strictly read-only
 query over the existing index.
 
+Use `ctx sql` only when normal search does not express the question, such as
+exact counts, joins, audits, or scripting over stable `ctx_*` views. It is
+read-only and does not refresh or import provider history.
+
 When ctx runs inside Codex and `CODEX_THREAD_ID` is available, search excludes
 the active Codex session tree by default to avoid returning the current prompt
 or its subagent work as the top match. Use `--include-current-session` only when

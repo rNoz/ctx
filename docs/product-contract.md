@@ -23,6 +23,8 @@ product boundary is retrieval, not interpretation.
   artifacts.
 - `ctx locate session` and `ctx locate event` report provenance and resume
   metadata.
+- `ctx sql` runs one read-only SQL statement against the existing local index
+  for advanced inspection when normal search is not expressive enough.
 - `ctx doctor` reports local storage health.
 - `ctx docs` exposes embedded public documentation and generated man pages.
 - `ctx upgrade` checks and applies signed CLI releases for official
@@ -36,6 +38,7 @@ product boundary is retrieval, not interpretation.
 - browser UI;
 - source repository modification;
 - shell startup-file modification;
+- write-capable SQL access;
 - API-key requirements for core setup/import/search;
 - background collection;
 - self-upgrade for unmanaged source builds, package-manager installs, or copied
