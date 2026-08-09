@@ -455,6 +455,107 @@ fn attributed_malformed_call_does_not_suppress_an_unrelated_unique_call() {
 }
 
 #[test]
+fn concatenated_ancestor_calls_only_suppress_their_exact_identifiers_on_replay() {
+    use ctx_history_core::EventOrigin;
+
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    let index = temp.path().join("global-index");
+    let repository = temp.path().join("repo");
+    fs::create_dir_all(&sessions).unwrap();
+    initialize_repository(&repository);
+    let parent = "019fa000-0000-7000-8000-000000000230";
+    let child = "019fa000-0000-7000-8000-000000000231";
+    let target = "unique-after-concatenated-row";
+    let concatenated = concat!(
+        r#"{"type":"response_item","payload":{"type":"function_call","call_id":"unrelated-a","name":"exec"}}"#,
+        r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"unrelated-b","output":"ok"}}"#
+    );
+    write_session(
+        &sessions,
+        parent,
+        &[
+            message("user", "parent session anchor"),
+            concatenated.to_owned(),
+            descendant_started(child),
+        ],
+    );
+    ingest_codex_source_backed_v0(&sessions, &index).unwrap();
+
+    write_forked_session(
+        &sessions,
+        child,
+        parent,
+        &[
+            exec_call(
+                target,
+                "git commit -m child && git rev-parse --verify HEAD",
+                &repository,
+            ),
+            successful_result(
+                target,
+                Value::String(
+                    "[main 7777777] child\n7777777777777777777777777777777777777777\n".to_owned(),
+                ),
+            ),
+        ],
+    );
+    let refresh = ingest_codex_source_backed_v0(&sessions, &index).unwrap();
+    assert_eq!(refresh.counters.replayed_sources, 1);
+    let child_source = codex_source_key(child).unwrap();
+    let child_session = codex_session_identity(&child_source, child).unwrap();
+    let result = outcome_for_sequence(&VerifiedIndex::open(&index).unwrap(), child_session, 2);
+    assert_eq!(result.event_origin, EventOrigin::UniqueToSession);
+    assert_eq!(result.repository_vcs_observations.len(), 1);
+}
+
+#[test]
+fn concatenated_ancestor_call_with_same_identifier_still_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    let index = temp.path().join("global-index");
+    let repository = temp.path().join("repo");
+    fs::create_dir_all(&sessions).unwrap();
+    initialize_repository(&repository);
+    let parent = "019fa000-0000-7000-8000-000000000232";
+    let child = "019fa000-0000-7000-8000-000000000233";
+    let target = "copied-from-concatenated-row";
+    let concatenated = format!(
+        r#"{{"type":"response_item","payload":{{"type":"function_call","call_id":"{target}","name":"exec"}}}}{{"type":"event_msg","payload":{{"type":"token_count"}}}}"#
+    );
+    write_session(
+        &sessions,
+        parent,
+        &[
+            message("user", "parent session anchor"),
+            concatenated,
+            descendant_started(child),
+        ],
+    );
+    write_forked_session(
+        &sessions,
+        child,
+        parent,
+        &[
+            exec_call(
+                target,
+                "git commit -m child && git rev-parse --verify HEAD",
+                &repository,
+            ),
+            successful_result(
+                target,
+                Value::String(
+                    "[main 8888888] child\n8888888888888888888888888888888888888888\n".to_owned(),
+                ),
+            ),
+        ],
+    );
+
+    ingest_codex_source_backed_v0(&sessions, &index).unwrap();
+    assert_child_outcome_is_unproven(&VerifiedIndex::open(&index).unwrap(), child);
+}
+
+#[test]
 fn fully_escaped_duplicate_call_id_after_non_string_cannot_publish_a_unique_child_outcome() {
     let temp = tempfile::tempdir().unwrap();
     let sessions = temp.path().join("sessions");

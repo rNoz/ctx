@@ -46,15 +46,14 @@ impl CodexNativeScanner {
                 (recovered, true)
             }
             Err(_) => {
-                let mut lineage_recorded = false;
-                if malformed_record_may_contain_lineage(record) {
-                    if let Some(lineage_facts) = self.lineage_facts.as_mut() {
-                        lineage_facts.record_at(
-                            CodexLineageRecordEvidence::UnattributedAmbiguity,
-                            self.raw_ordinal,
-                        )?;
-                    }
-                    lineage_recorded = true;
+                let malformed_evidence = malformed_codex_lineage_record_evidence(record);
+                let lineage_recorded = !matches!(
+                    malformed_evidence,
+                    CodexMalformedLineageRecordEvidence::None
+                );
+                if let Some(lineage_facts) = self.lineage_facts.as_mut() {
+                    lineage_facts
+                        .record_at(malformed_evidence.as_record_evidence(), self.raw_ordinal)?;
                 }
                 let Some(recovered) = classify_mcp_terminal_after_selector_ambiguity(record) else {
                     self.reject(false);
