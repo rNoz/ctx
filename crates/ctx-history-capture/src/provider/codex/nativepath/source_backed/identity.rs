@@ -296,6 +296,9 @@ pub(super) fn codex_core_record(
         repository_result.as_ref(),
         provider_event_identity.as_ref(),
     ) {
+        (Some(CodexOutcomeOriginV0::UniqueToSession), Some(_), _) => {
+            Some(ctx_history_core::EventOrigin::UniqueToSession)
+        }
         (
             Some(CodexOutcomeOriginV0::CopiedFromAncestor {
                 ancestor_native_session_id,

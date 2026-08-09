@@ -208,7 +208,7 @@ fn codex_lineage_evidence_authority_retains_certified_unique_repository_outcome(
     let child_source = codex_source_key(child).unwrap();
     let child_session = codex_session_identity(&child_source, child).unwrap();
     let result = outcome_for_sequence(&verified, child_session, 2);
-    assert_eq!(result.event_origin, EventOrigin::Unknown);
+    assert_eq!(result.event_origin, EventOrigin::UniqueToSession);
     assert!(result
         .repository_vcs_observations
         .iter()

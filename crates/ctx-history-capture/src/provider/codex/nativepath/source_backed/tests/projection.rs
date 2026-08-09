@@ -720,7 +720,10 @@ fn codex_forked_history_attributes_one_canonical_execution_origin() {
     };
     assert_eq!(outcome.produced_object_ids[0].hex, child_oid);
     assert_eq!(outcome.linkage.origin_call_id, "call-child-execution");
-    assert_eq!(unique_child_result.event_origin, EventOrigin::Unknown);
+    assert_eq!(
+        unique_child_result.event_origin,
+        EventOrigin::UniqueToSession
+    );
 
     let copied_child_call = outcome_for_sequence(&verified, child_session, 1);
     assert_eq!(copied_child_call.event_origin, EventOrigin::Unknown);
