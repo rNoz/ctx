@@ -6,6 +6,15 @@ use super::projection::{
     exec_call, initialize_repository, outcome_for_sequence, successful_result,
 };
 
+fn uuid_v7_at_unix_ms(unix_ms: u64, suffix: u64) -> String {
+    format!(
+        "{:08x}-{:04x}-7000-8000-{:012x}",
+        unix_ms >> 16,
+        unix_ms & 0xffff,
+        suffix
+    )
+}
+
 fn assert_child_outcome_is_unproven(index: &VerifiedIndex, child_native_session_id: &str) {
     assert_child_outcome_at_sequence_is_unproven(index, child_native_session_id, 2);
 }
@@ -23,6 +32,121 @@ fn assert_child_outcome_at_sequence_is_unproven(
         abstention.reason == RepositoryAbstentionReason::ProviderOutputUnjoined
             && abstention.detail.as_deref() == Some("provider_execution_origin_lineage_unproven")
     }));
+}
+
+#[test]
+fn post_fork_ancestor_corruption_does_not_poison_a_transitive_child_outcome() {
+    use ctx_history_core::EventOrigin;
+
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    let index = temp.path().join("global-index");
+    let repository = temp.path().join("repo");
+    fs::create_dir_all(&sessions).unwrap();
+    initialize_repository(&repository);
+    let root = uuid_v7_at_unix_ms(1_785_240_000_000, 1);
+    let fork = uuid_v7_at_unix_ms(1_785_241_800_000, 2);
+    let child = uuid_v7_at_unix_ms(1_785_242_700_000, 3);
+    write_session(
+        &sessions,
+        &root,
+        &[
+            message("user", "root before fork"),
+            descendant_started(&fork),
+            r#"{"timestamp":"2026-07-28T13:00:00Z","type":"response_item","payload":{"type":"function_call","arguments":"#.to_owned(),
+        ],
+    );
+    write_forked_session_at(
+        &sessions,
+        &fork,
+        &root,
+        "2026-07-28T12:30:00Z",
+        &[
+            message("user", "fork before delegated child"),
+            descendant_started(&child),
+        ],
+    );
+    write_forked_session_at(
+        &sessions,
+        &child,
+        &fork,
+        "2026-07-28T12:45:00Z",
+        &[
+            exec_call(
+                "transitive-child-call",
+                "git commit -m child && git rev-parse --verify HEAD",
+                &repository,
+            ),
+            successful_result(
+                "transitive-child-call",
+                Value::String(
+                    "[main 5555555] child\n5555555555555555555555555555555555555555\n".to_owned(),
+                ),
+            ),
+        ],
+    );
+
+    ingest_codex_source_backed_v0(&sessions, &index).unwrap();
+    let child_source = codex_source_key(&child).unwrap();
+    let child_session = codex_session_identity(&child_source, &child).unwrap();
+    let verified = VerifiedIndex::open(&index).unwrap();
+    let result = outcome_for_sequence(&verified, child_session, 2);
+    assert_eq!(result.event_origin, EventOrigin::UniqueToSession);
+    assert_eq!(result.repository_vcs_observations.len(), 1);
+}
+
+#[test]
+fn pre_fork_ancestor_corruption_still_fails_closed_transitively() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    let index = temp.path().join("global-index");
+    let repository = temp.path().join("repo");
+    fs::create_dir_all(&sessions).unwrap();
+    initialize_repository(&repository);
+    let root = uuid_v7_at_unix_ms(1_785_240_000_000, 4);
+    let fork = uuid_v7_at_unix_ms(1_785_241_800_000, 5);
+    let child = uuid_v7_at_unix_ms(1_785_242_700_000, 6);
+    write_session(
+        &sessions,
+        &root,
+        &[
+            message("user", "root before fork"),
+            r#"{"timestamp":"2026-07-28T12:15:00Z","type":"response_item","payload":{"type":"function_call","arguments":"#.to_owned(),
+            descendant_started(&fork),
+        ],
+    );
+    write_forked_session_at(
+        &sessions,
+        &fork,
+        &root,
+        "2026-07-28T12:30:00Z",
+        &[
+            message("user", "fork before delegated child"),
+            descendant_started(&child),
+        ],
+    );
+    write_forked_session_at(
+        &sessions,
+        &child,
+        &fork,
+        "2026-07-28T12:45:00Z",
+        &[
+            exec_call(
+                "transitive-unproven-call",
+                "git commit -m child && git rev-parse --verify HEAD",
+                &repository,
+            ),
+            successful_result(
+                "transitive-unproven-call",
+                Value::String(
+                    "[main 6666666] child\n6666666666666666666666666666666666666666\n".to_owned(),
+                ),
+            ),
+        ],
+    );
+
+    ingest_codex_source_backed_v0(&sessions, &index).unwrap();
+    assert_child_outcome_is_unproven(&VerifiedIndex::open(&index).unwrap(), &child);
 }
 
 #[test]
@@ -70,6 +194,60 @@ fn checkpoint_replay_preserves_incomplete_tail_lineage_ambiguity() {
     let refresh = ingest_codex_source_backed_v0(&sessions, &index).unwrap();
     assert_eq!(refresh.counters.replayed_sources, 1);
     assert_child_outcome_is_unproven(&VerifiedIndex::open(&index).unwrap(), child);
+}
+
+#[test]
+fn checkpoint_replay_bounds_incomplete_tail_after_typed_descendant_start() {
+    use ctx_history_core::EventOrigin;
+
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    let index = temp.path().join("global-index");
+    let repository = temp.path().join("repo");
+    fs::create_dir_all(&sessions).unwrap();
+    initialize_repository(&repository);
+    let parent = "019fa000-0000-7000-8000-000000000220";
+    let child = "019fa000-0000-7000-8000-000000000221";
+    let incomplete =
+        r#"{"type":"response_item","payload":{"type":"function_call","call_id":"unterminated"#;
+    fs::write(
+        session_path(&sessions, parent),
+        format!(
+            "{}\n{}\n{}\n{incomplete}",
+            session_meta(parent),
+            message("user", "parent session anchor"),
+            descendant_started(child)
+        ),
+    )
+    .unwrap();
+
+    ingest_codex_source_backed_v0(&sessions, &index).unwrap();
+    write_forked_session(
+        &sessions,
+        child,
+        parent,
+        &[
+            exec_call(
+                "child-after-bounded-tail",
+                "git commit -m child && git rev-parse --verify HEAD",
+                &repository,
+            ),
+            successful_result(
+                "child-after-bounded-tail",
+                Value::String(
+                    "[main ababab1] child\nababab1ababab1ababab1ababab1ababab1ababa\n".to_owned(),
+                ),
+            ),
+        ],
+    );
+
+    let refresh = ingest_codex_source_backed_v0(&sessions, &index).unwrap();
+    assert_eq!(refresh.counters.replayed_sources, 1);
+    let child_source = codex_source_key(child).unwrap();
+    let child_session = codex_session_identity(&child_source, child).unwrap();
+    let result = outcome_for_sequence(&VerifiedIndex::open(&index).unwrap(), child_session, 2);
+    assert_eq!(result.event_origin, EventOrigin::UniqueToSession);
+    assert_eq!(result.repository_vcs_observations.len(), 1);
 }
 
 #[test]
@@ -274,6 +452,107 @@ fn attributed_malformed_call_does_not_suppress_an_unrelated_unique_call() {
         abstention.reason == RepositoryAbstentionReason::ProviderOutputUnjoined
             && abstention.detail.as_deref() == Some("provider_execution_origin_lineage_unproven")
     }));
+}
+
+#[test]
+fn concatenated_ancestor_calls_only_suppress_their_exact_identifiers_on_replay() {
+    use ctx_history_core::EventOrigin;
+
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    let index = temp.path().join("global-index");
+    let repository = temp.path().join("repo");
+    fs::create_dir_all(&sessions).unwrap();
+    initialize_repository(&repository);
+    let parent = "019fa000-0000-7000-8000-000000000230";
+    let child = "019fa000-0000-7000-8000-000000000231";
+    let target = "unique-after-concatenated-row";
+    let concatenated = concat!(
+        r#"{"type":"response_item","payload":{"type":"function_call","call_id":"unrelated-a","name":"exec"}}"#,
+        r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"unrelated-b","output":"ok"}}"#
+    );
+    write_session(
+        &sessions,
+        parent,
+        &[
+            message("user", "parent session anchor"),
+            concatenated.to_owned(),
+            descendant_started(child),
+        ],
+    );
+    ingest_codex_source_backed_v0(&sessions, &index).unwrap();
+
+    write_forked_session(
+        &sessions,
+        child,
+        parent,
+        &[
+            exec_call(
+                target,
+                "git commit -m child && git rev-parse --verify HEAD",
+                &repository,
+            ),
+            successful_result(
+                target,
+                Value::String(
+                    "[main 7777777] child\n7777777777777777777777777777777777777777\n".to_owned(),
+                ),
+            ),
+        ],
+    );
+    let refresh = ingest_codex_source_backed_v0(&sessions, &index).unwrap();
+    assert_eq!(refresh.counters.replayed_sources, 1);
+    let child_source = codex_source_key(child).unwrap();
+    let child_session = codex_session_identity(&child_source, child).unwrap();
+    let result = outcome_for_sequence(&VerifiedIndex::open(&index).unwrap(), child_session, 2);
+    assert_eq!(result.event_origin, EventOrigin::UniqueToSession);
+    assert_eq!(result.repository_vcs_observations.len(), 1);
+}
+
+#[test]
+fn concatenated_ancestor_call_with_same_identifier_still_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions");
+    let index = temp.path().join("global-index");
+    let repository = temp.path().join("repo");
+    fs::create_dir_all(&sessions).unwrap();
+    initialize_repository(&repository);
+    let parent = "019fa000-0000-7000-8000-000000000232";
+    let child = "019fa000-0000-7000-8000-000000000233";
+    let target = "copied-from-concatenated-row";
+    let concatenated = format!(
+        r#"{{"type":"response_item","payload":{{"type":"function_call","call_id":"{target}","name":"exec"}}}}{{"type":"event_msg","payload":{{"type":"token_count"}}}}"#
+    );
+    write_session(
+        &sessions,
+        parent,
+        &[
+            message("user", "parent session anchor"),
+            concatenated,
+            descendant_started(child),
+        ],
+    );
+    write_forked_session(
+        &sessions,
+        child,
+        parent,
+        &[
+            exec_call(
+                target,
+                "git commit -m child && git rev-parse --verify HEAD",
+                &repository,
+            ),
+            successful_result(
+                target,
+                Value::String(
+                    "[main 8888888] child\n8888888888888888888888888888888888888888\n".to_owned(),
+                ),
+            ),
+        ],
+    );
+
+    ingest_codex_source_backed_v0(&sessions, &index).unwrap();
+    assert_child_outcome_is_unproven(&VerifiedIndex::open(&index).unwrap(), child);
 }
 
 #[test]

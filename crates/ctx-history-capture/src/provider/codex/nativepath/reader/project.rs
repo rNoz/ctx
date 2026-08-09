@@ -36,7 +36,8 @@ impl CodexNativeScanner {
             Ok(probe) if !probe.lineage_malformed() => (probe, false),
             Ok(probe) => {
                 if let Some(lineage_facts) = self.lineage_facts.as_mut() {
-                    lineage_facts.record(codex_lineage_record_evidence(&probe))?;
+                    lineage_facts
+                        .record_at(codex_lineage_record_evidence(&probe), self.raw_ordinal)?;
                 }
                 let Some(recovered) = classify_mcp_terminal_after_selector_ambiguity(record) else {
                     self.reject(false);
@@ -45,12 +46,14 @@ impl CodexNativeScanner {
                 (recovered, true)
             }
             Err(_) => {
-                let mut lineage_recorded = false;
-                if malformed_record_may_contain_lineage(record) {
-                    if let Some(lineage_facts) = self.lineage_facts.as_mut() {
-                        lineage_facts.record(CodexLineageRecordEvidence::UnattributedAmbiguity)?;
-                    }
-                    lineage_recorded = true;
+                let malformed_evidence = malformed_codex_lineage_record_evidence(record);
+                let lineage_recorded = !matches!(
+                    malformed_evidence,
+                    CodexMalformedLineageRecordEvidence::None
+                );
+                if let Some(lineage_facts) = self.lineage_facts.as_mut() {
+                    lineage_facts
+                        .record_at(malformed_evidence.as_record_evidence(), self.raw_ordinal)?;
                 }
                 let Some(recovered) = classify_mcp_terminal_after_selector_ambiguity(record) else {
                     self.reject(false);
@@ -62,7 +65,7 @@ impl CodexNativeScanner {
         if !lineage_already_recorded {
             let lineage_evidence = codex_lineage_record_evidence(&probe);
             if let Some(lineage_facts) = self.lineage_facts.as_mut() {
-                lineage_facts.record(lineage_evidence)?;
+                lineage_facts.record_at(lineage_evidence, self.raw_ordinal)?;
             }
         }
         if probe.lineage_malformed() {
@@ -70,6 +73,10 @@ impl CodexNativeScanner {
             return Ok(CodexRecordProjection::default());
         }
         match probe.class {
+            CodexRecordClass::DescendantActivity | CodexRecordClass::DescendantStarted => {
+                self.counters.ignored_records = self.counters.ignored_records.saturating_add(1);
+                Ok(CodexRecordProjection::default())
+            }
             CodexRecordClass::SessionMeta => {
                 self.counters.typed_json_parses = self.counters.typed_json_parses.saturating_add(1);
                 match parse_session_meta(record) {

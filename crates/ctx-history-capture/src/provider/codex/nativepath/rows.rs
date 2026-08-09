@@ -569,7 +569,9 @@ pub(super) fn source_backed_display_text(
                 }
             }
         }
-        CodexRecordClass::SessionMeta
+        CodexRecordClass::DescendantActivity
+        | CodexRecordClass::DescendantStarted
+        | CodexRecordClass::SessionMeta
         | CodexRecordClass::TurnContext
         | CodexRecordClass::Ignored => {
             CodexSourceBackedDocumentEligibility::IntentionallyNonDisplay
